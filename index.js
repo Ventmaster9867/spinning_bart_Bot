@@ -22,6 +22,7 @@ const MENTION_RESPONSES = [
     "Stop talking to me..."
 ];
 
+// --- Helper to set status safely ---
 async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', status = 'idle') {
     try {
         await client.user.setPresence({
@@ -36,10 +37,10 @@ async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', statu
 
 // --- Bot ready ---
 client.once('ready', async () => {
-    console.log(`Logged in as ${client.user.tag}`);
+    console.log(`✅ Logged in as ${client.user.tag}`);
     await safeSetStatus();
 
-    // --- Slash commands registered safely after login ---
+    // --- Register slash commands AFTER login ---
     const commands = [
         new SlashCommandBuilder()
             .setName('bart-spawn')
@@ -52,6 +53,7 @@ client.once('ready', async () => {
     ];
 
     const rest = new REST({ version: '10' }).setToken(TOKEN);
+
     try {
         console.log('Registering slash commands...');
         await rest.put(
@@ -139,7 +141,7 @@ client.on('messageCreate', async message => {
     }
 });
 
-// --- Catch all unhandled errors ---
+// --- Catch-all error handling ---
 process.on('unhandledRejection', async err => {
     console.error('Unhandled promise rejection:', err);
     if (client.user) await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
