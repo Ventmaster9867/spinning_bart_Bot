@@ -9,13 +9,13 @@ const {
     ButtonBuilder,
     ButtonStyle,
     ActionRowBuilder,
-    InteractionType
+    InteractionType,
+    ChannelType
 } = require('discord.js');
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
 const ANNOUNCE_CHANNEL_ID = '1452777822618648678';
-const ALERT_CHANNEL_ID = '1452777822618648678'; // Same channel for code alerts
 const WHITELIST_ROLES = ['1410771734700888064','1395231118537523220'];
 const SHIFT_ROLE_ID = '1475191266084917298';
 const LOG_ROLE_ID = '1395209235389743114';
@@ -204,16 +204,19 @@ client.on('interactionCreate',async interaction=>{
             return interaction.editReply(`📖 Logs:\n${text}`);
         }
 
-        // -------------------- CODE ALERTS --------------------
+        // -------------------- CODE ALERTS (VC TEXT CHANNEL) --------------------
         if(interaction.commandName==='code-red' || interaction.commandName==='code-orange'){
             const location = interaction.options.getString('location');
             const vc = member.voice.channel;
             if(!vc) return interaction.editReply({ content: '❌ You must be in a voice channel to call this code!', ephemeral: true });
-            const alertChannel = await interaction.guild.channels.fetch(ALERT_CHANNEL_ID);
-            if(!alertChannel) return interaction.editReply('❌ Alert text channel not found.');
-            const codeType = interaction.commandName==='code-red'?'Code red':'Code orange';
-            await alertChannel.send(`${codeType} called by ${interaction.user.username} at ${location}!`);
-            return interaction.editReply({ content: `✅ ${codeType} sent to VC alert channel.`, ephemeral: true });
+
+            // Find linked text channel with the same name as the VC
+            const linkedText = vc.guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name.toLowerCase().includes(vc.name.toLowerCase()));
+            if(!linkedText) return interaction.editReply({ content: '❌ Could not find a linked text channel for this VC!', ephemeral: true });
+
+            const codeType = interaction.commandName==='code-red'?'Code Red':'Code Orange';
+            await linkedText.send(`${codeType} called by ${interaction.user.username} at ${location}!`);
+            return interaction.editReply({ content: `✅ ${codeType} sent in the VC text channel "${linkedText.name}".`, ephemeral: true });
         }
 
         // -------------------- SESSION COMMANDS --------------------
