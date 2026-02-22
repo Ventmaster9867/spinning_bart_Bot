@@ -25,6 +25,10 @@ const {
 const gTTS = require('gtts');
 const fs = require('fs');
 const path = require('path');
+const ffmpegPath = require('ffmpeg-static');
+
+// Tell fluent-ffmpeg and discord voice where ffmpeg is
+process.env.FFMPEG_PATH = ffmpegPath;
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
@@ -55,6 +59,9 @@ async function speakInVC(voiceChannel, message) {
 
             await new Promise((res, rej) => gtts.save(ttsFilePath, err => err ? rej(err) : res()));
 
+            // Small delay to make sure file is fully written
+            await new Promise(res => setTimeout(res, 500));
+
             // Join the voice channel
             const connection = joinVoiceChannel({
                 channelId: voiceChannel.id,
@@ -67,15 +74,32 @@ async function speakInVC(voiceChannel, message) {
             // Wait until the connection is ready
             await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
 
-            // Create player and resource
+            // Use ffmpeg to convert mp3 to opus stream for Discord
+            const { spawn } = require('child_process');
+            const ffmpeg = spawn(ffmpegPath, [
+                '-i', ttsFilePath,
+                '-acodec', 'libopus',
+                '-f', 'opus',
+                '-ar', '48000',
+                '-ac', '2',
+                'pipe:1'
+            ]);
+
             const player = createAudioPlayer();
-            const resource = createAudioResource(ttsFilePath);
+            const resource = createAudioResource(ffmpeg.stdout);
 
             connection.subscribe(player);
             player.play(resource);
 
             // When finished playing, disconnect and clean up
             player.on(AudioPlayerStatus.Idle, () => {
+                connection.destroy();
+                fs.unlink(ttsFilePath, () => {});
+                resolve();
+            });
+
+            player.on('error', err => {
+                console.error('Player error:', err);
                 connection.destroy();
                 fs.unlink(ttsFilePath, () => {});
                 resolve();
