@@ -9,18 +9,18 @@ const {
     ButtonBuilder,
     ButtonStyle,
     ActionRowBuilder,
-    InteractionType,
-    ComponentType
+    InteractionType
 } = require('discord.js');
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
 const ANNOUNCE_CHANNEL_ID = '1452777822618648678';
+const ALERT_CHANNEL_ID = '1452777822618648678'; // Same channel for code alerts
 const WHITELIST_ROLES = ['1410771734700888064','1395231118537523220'];
 const SHIFT_ROLE_ID = '1475191266084917298';
 const LOG_ROLE_ID = '1395209235389743114';
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 
 let botReady = false;
 let sessionStartTime = null;
@@ -83,7 +83,11 @@ client.once('ready', async () => {
         new SlashCommandBuilder().setName('del-activity').setDescription('Delete activity record')
             .addUserOption(o=>o.setName('user').setDescription('Target user').setRequired(true))
             .addStringOption(o=>o.setName('reason').setDescription('Reason').setRequired(true)).toJSON(),
-        new SlashCommandBuilder().setName('logs').setDescription('View global logs').toJSON()
+        new SlashCommandBuilder().setName('logs').setDescription('View global logs').toJSON(),
+        new SlashCommandBuilder().setName('code-red').setDescription('Call Code Red alert')
+            .addStringOption(o=>o.setName('location').setDescription('Location').setRequired(true)).toJSON(),
+        new SlashCommandBuilder().setName('code-orange').setDescription('Call Code Orange alert')
+            .addStringOption(o=>o.setName('location').setDescription('Location').setRequired(true)).toJSON()
     ];
 
     try {
@@ -150,10 +154,10 @@ client.on('interactionCreate',async interaction=>{
         if(!channel) return interaction.editReply('❌ Announcement channel missing.');
 
         if(interaction.commandName==='help'){
-            return interaction.editReply(`🛠 Commands:\n• /help\n• /ssu\n• /server-hop\n• /ssd\n• /schedule (restricted)\n• /view-schedule\n• /activity-view\n• /del-activity (restricted)\n• /logs (role required)`);
+            return interaction.editReply(`🛠 Commands:\n• /help\n• /ssu\n• /server-hop\n• /ssd\n• /schedule (restricted)\n• /view-schedule\n• /activity-view\n• /del-activity (restricted)\n• /logs (role required)\n• /code-red\n• /code-orange`);
         }
 
-        // -------------------- SCHEDULE COMMANDS --------------------
+        // -------------------- SCHEDULE --------------------
         if(interaction.commandName==='schedule'){
             if(!hasRole) return interaction.editReply('❌ No permission.');
             const timeInput = interaction.options.getString('time');
@@ -172,6 +176,7 @@ client.on('interactionCreate',async interaction=>{
             return interaction.editReply(`📅 Upcoming sessions:\n${text}`);
         }
 
+        // -------------------- ACTIVITY --------------------
         if(interaction.commandName==='activity-view'){
             if(activity.size===0) return interaction.editReply('No activity recorded.');
             const text = [...activity.entries()].map(([id,secs])=>{
@@ -197,6 +202,18 @@ client.on('interactionCreate',async interaction=>{
             if(logs.length===0) return interaction.editReply('No logs yet.');
             const text = logs.map(l=>`[${new Date(l.timestamp).toLocaleString()}] ${l.text}`).join('\n');
             return interaction.editReply(`📖 Logs:\n${text}`);
+        }
+
+        // -------------------- CODE ALERTS --------------------
+        if(interaction.commandName==='code-red' || interaction.commandName==='code-orange'){
+            const location = interaction.options.getString('location');
+            const vc = member.voice.channel;
+            if(!vc) return interaction.editReply({ content: '❌ You must be in a voice channel to call this code!', ephemeral: true });
+            const alertChannel = await interaction.guild.channels.fetch(ALERT_CHANNEL_ID);
+            if(!alertChannel) return interaction.editReply('❌ Alert text channel not found.');
+            const codeType = interaction.commandName==='code-red'?'Code red':'Code orange';
+            await alertChannel.send(`${codeType} called by ${interaction.user.username} at ${location}!`);
+            return interaction.editReply({ content: `✅ ${codeType} sent to VC alert channel.`, ephemeral: true });
         }
 
         // -------------------- SESSION COMMANDS --------------------
@@ -235,7 +252,6 @@ client.on('interactionCreate',async interaction=>{
             if(sessionInterval){clearInterval(sessionInterval);sessionInterval=null;}
             sessionStartTime=null;
 
-            // update all active shifts to activity
             for(const [id,data] of activeShifts.entries()){
                 const duration = Math.floor((Date.now()-data.startTime)/1000);
                 activity.set(id,(activity.get(id)||0)+duration);
@@ -243,7 +259,6 @@ client.on('interactionCreate',async interaction=>{
             activeShifts.clear();
             await setNormalStatus();
 
-            // post leaderboard
             if(activity.size>0){
                 const text = [...activity.entries()].map(([id,secs])=>{
                     const hrs=Math.floor(secs/3600); const mins=Math.floor((secs%3600)/60); const s=secs%60;
@@ -251,7 +266,6 @@ client.on('interactionCreate',async interaction=>{
                 }).join('\n');
                 await channel.send(`📊 Session leaderboard:\n${text}`);
             }
-
             logs.push({timestamp:Date.now(),text:`${interaction.user.tag} ended session`});
             return interaction.editReply('✅ Session ended.');
         }
