@@ -26,9 +26,13 @@ const gTTS = require('gtts');
 const fs = require('fs');
 const path = require('path');
 const ffmpegPath = require('ffmpeg-static');
+const sodium = require('libsodium-wrappers');
 
 // Tell fluent-ffmpeg and discord voice where ffmpeg is
 process.env.FFMPEG_PATH = ffmpegPath;
+
+// Initialise libsodium before anything else runs
+(async () => { await sodium.ready; })();
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
