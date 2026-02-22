@@ -59,7 +59,7 @@ client.once('ready', async () => {
     try {
         await setNormalStatus();
     } catch (err) {
-        console.error('Status set failed on startup:', err);
+        console.error('Startup status error:', err);
     }
 
     const commands = [
@@ -97,7 +97,7 @@ client.once('ready', async () => {
         );
         console.log('Slash commands registered.');
     } catch (err) {
-        console.error('Slash command registration failed:', err);
+        console.error('Slash registration failed:', err);
         await setDowntimeStatus();
     }
 });
@@ -120,7 +120,9 @@ client.on('interactionCreate', async (interaction) => {
             });
         }
 
-        // Proper full member fetch (prevents partial crash)
+        await interaction.deferReply({ ephemeral: true });
+
+        // Proper full member fetch
         const member = await interaction.guild.members.fetch(interaction.user.id);
 
         const hasRole = ALLOWED_ROLES.some(roleId =>
@@ -128,20 +130,23 @@ client.on('interactionCreate', async (interaction) => {
         );
 
         if (!hasRole) {
-            return interaction.reply({
-                content: '❌ You do not have permission to use this command.',
-                ephemeral: true
-            });
+            return interaction.editReply('❌ You do not have permission to use this command.');
         }
 
         const gameLink = interaction.options.getString('game-link');
 
-        const channel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID);
+        // URL validation
+        if (!gameLink || !gameLink.startsWith('https://')) {
+            return interaction.editReply('❌ Invalid link. Must start with https://');
+        }
+
+        let channel = interaction.guild.channels.cache.get(ANNOUNCE_CHANNEL_ID);
         if (!channel) {
-            return interaction.reply({
-                content: '❌ Announcement channel not found.',
-                ephemeral: true
-            });
+            channel = await interaction.guild.channels.fetch(ANNOUNCE_CHANNEL_ID);
+        }
+
+        if (!channel) {
+            return interaction.editReply('❌ Announcement channel not found.');
         }
 
         const button = new ButtonBuilder()
@@ -179,10 +184,7 @@ client.on('interactionCreate', async (interaction) => {
             components: [row]
         });
 
-        await interaction.reply({
-            content: '✅ Announcement sent.',
-            ephemeral: true
-        });
+        await interaction.editReply('✅ Announcement sent.');
 
     } catch (err) {
         console.error('Command error:', err);
@@ -190,9 +192,7 @@ client.on('interactionCreate', async (interaction) => {
         if (botReady) {
             try {
                 await setDowntimeStatus();
-            } catch (statusErr) {
-                console.error('Downtime status failed:', statusErr);
-            }
+            } catch {}
         }
 
         if (!interaction.replied) {
@@ -209,18 +209,14 @@ client.on('interactionCreate', async (interaction) => {
 process.on('unhandledRejection', async (err) => {
     console.error('Unhandled rejection:', err);
     if (botReady) {
-        try {
-            await setDowntimeStatus();
-        } catch {}
+        try { await setDowntimeStatus(); } catch {}
     }
 });
 
 process.on('uncaughtException', async (err) => {
     console.error('Uncaught exception:', err);
     if (botReady) {
-        try {
-            await setDowntimeStatus();
-        } catch {}
+        try { await setDowntimeStatus(); } catch {}
     }
 });
 
