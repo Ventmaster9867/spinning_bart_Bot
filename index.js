@@ -1,38 +1,65 @@
-const { Client, GatewayIntentBits, ActivityType } = require('discord.js');
-const cron = require('node-cron');
+const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 
-const TOKEN = process.env.TOKEN;
-const CHANNEL_ID = '1395225224081051668';
+// -----------------------------
+// Slash Command Registration
+// -----------------------------
+const commands = [
+    new SlashCommandBuilder()
+        .setName('bart-spawn')
+        .setDescription('Spawns 3 Bart stare GIFs in this channel')
+        .toJSON()
+];
 
-const client = new Client({
-    intents: [GatewayIntentBits.Guilds]
-});
+const rest = new REST({ version: '10' }).setToken(TOKEN);
 
-client.once('ready', async () => {
-    console.log(`Logged in as ${client.user.tag}`);
+// Replace with your server ID
+const GUILD_ID = '1394380681341173810';
 
-    // Set bot status to idle and activity text
-    client.user.setPresence({
-        status: 'idle', // 'online', 'idle', 'dnd', 'invisible'
-        activities: [{
-            name: 'Created by ventmaster9867 ✨',
-            type: ActivityType.Playing // You can also use 'Watching', 'Listening', 'Competing'
-        }]
-    });
+(async () => {
+    try {
+        console.log('Registering slash commands...');
+        await rest.put(
+            Routes.applicationGuildCommands(client.user.id, GUILD_ID),
+            { body: commands }
+        );
+        console.log('Slash commands registered.');
+    } catch (err) {
+        console.error(err);
+    }
+})();
 
-    // Schedule daily Bart GIF at 4:00 PM EST
-    cron.schedule('0 16 * * *', async () => {
-        try {
-            const channel = await client.channels.fetch(CHANNEL_ID);
-            if (!channel) return;
-            await channel.send('https://tenor.com/view/bart-simpson-bart-stare-simpsons-jgmm-capcut-spin-filter-gif-11221581157512010324');
-            console.log('Daily Bart stare deployed.');
-        } catch (err) {
-            console.error('Failed to send daily gif:', err);
+// -----------------------------
+// Cooldown Map
+// -----------------------------
+const cooldowns = new Map();
+
+// -----------------------------
+// Interaction Listener
+// -----------------------------
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.commandName === 'bart-spawn') {
+        const userId = interaction.user.id;
+        const now = Date.now();
+        const cooldownAmount = 60 * 1000; // 1 minute in ms
+
+        if (cooldowns.has(userId) && now - cooldowns.get(userId) < cooldownAmount) {
+            return interaction.reply({ content: '⏱ You need to wait 1 minute before using this again.', ephemeral: true });
         }
-    }, {
-        timezone: 'America/New_York'
-    });
-});
 
-client.login(TOKEN);
+        cooldowns.set(userId, now);
+
+        const gifURL = 'https://tenor.com/view/bart-simpson-bart-stare-simpsons-jgmm-capcut-spin-filter-gif-11221581157512010324';
+
+        try {
+            for (let i = 0; i < 3; i++) {
+                await interaction.channel.send(gifURL);
+            }
+            await interaction.reply({ content: '🎉 Bart has been spawned 3 times!', ephemeral: true });
+        } catch (err) {
+            console.error('Failed to send Bart GIFs:', err);
+            await interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
+        }
+    }
+});
