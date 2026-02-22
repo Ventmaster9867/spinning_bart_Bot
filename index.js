@@ -6,12 +6,15 @@ const CHANNEL_ID = '1395225224081051668';
 const GUILD_ID = '1394380681341173810';
 
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
 });
 
-const cooldowns = new Map(); // For /bart-spawn per-user cooldown
-let mentionCooldown = { count: 0, timestamp: Date.now() }; // global 5-per-minute
-
+const cooldowns = new Map(); // /bart-spawn per-user cooldown
+let mentionCooldown = { count: 0, timestamp: Date.now() }; // global 5 per minute
 const MENTION_RESPONSES = [
     "What do you want?",
     "Hi",
@@ -19,7 +22,6 @@ const MENTION_RESPONSES = [
     "Stop talking to me..."
 ];
 
-// --- Helper for safe status setting ---
 async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', status = 'idle') {
     try {
         await client.user.setPresence({
@@ -32,11 +34,12 @@ async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', statu
     }
 }
 
+// --- Bot ready ---
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
     await safeSetStatus();
 
-    // --- Slash command registration ---
+    // --- Slash commands registered safely after login ---
     const commands = [
         new SlashCommandBuilder()
             .setName('bart-spawn')
@@ -75,16 +78,15 @@ client.once('ready', async () => {
     }, { timezone: 'America/New_York' });
 });
 
-// --- Slash command interaction handler ---
+// --- Slash command handler ---
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
     const userId = interaction.user.id;
     const now = Date.now();
 
-    // --- /bart-spawn ---
     if (interaction.commandName === 'bart-spawn') {
-        const cooldownAmount = 60 * 1000; // 1 minute
+        const cooldownAmount = 60 * 1000;
         if (cooldowns.has(userId) && now - cooldowns.get(userId) < cooldownAmount) {
             return interaction.reply({ content: '⏱ You need to wait 1 minute before using this again.', ephemeral: true });
         }
@@ -93,9 +95,7 @@ client.on('interactionCreate', async interaction => {
         const gifURL = 'https://tenor.com/view/bart-simpson-bart-stare-simpsons-jgmm-capcut-spin-filter-gif-11221581157512010324';
 
         try {
-            for (let i = 0; i < 3; i++) {
-                await interaction.channel.send(gifURL);
-            }
+            for (let i = 0; i < 3; i++) await interaction.channel.send(gifURL);
             await interaction.reply({ content: '🎉 Bart has been spawned 3 times!', ephemeral: true });
         } catch (err) {
             console.error('Failed to send Bart GIFs:', err);
@@ -104,7 +104,6 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // --- /help ---
     if (interaction.commandName === 'help') {
         const helpText = `
 📌 **Daily Bart Info:**  
@@ -123,13 +122,12 @@ client.on('messageCreate', async message => {
     if (message.author.bot) return;
     if (!message.mentions.has(client.user)) return;
 
-    // Reset mention cooldown every minute
     if (Date.now() - mentionCooldown.timestamp > 60 * 1000) {
         mentionCooldown.count = 0;
         mentionCooldown.timestamp = Date.now();
     }
 
-    if (mentionCooldown.count >= 5) return; // max 5 per minute
+    if (mentionCooldown.count >= 5) return;
     mentionCooldown.count++;
 
     try {
@@ -141,7 +139,7 @@ client.on('messageCreate', async message => {
     }
 });
 
-// --- Catch all unhandled promise rejections ---
+// --- Catch all unhandled errors ---
 process.on('unhandledRejection', async err => {
     console.error('Unhandled promise rejection:', err);
     if (client.user) await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
