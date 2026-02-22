@@ -28,7 +28,7 @@ let botReady = false;
 let sessionStartTime = null;
 let sessionInterval = null;
 
-const schedules = []; // {id, userTag, type, startTime, endTime?, timezone, desc, signups:Set, notified}
+const schedules = []; // {id,userTag,type,startTime,endTime?,timezone,desc,signups:Set,notified}
 const activeShifts = new Map(); // userId -> {startTime, roleActive}
 const activity = new Map(); // userId -> seconds
 const grandActivity = new Map(); // userId -> seconds across all weeks
@@ -75,8 +75,10 @@ client.once('ready', async ()=>{
       .addStringOption(o=>o.setName('game-link').setDescription('Link').setRequired(true)).toJSON(),
     new SlashCommandBuilder().setName('ssd').setDescription('Shut down session').toJSON(),
     new SlashCommandBuilder().setName('schedule').setDescription('Schedule a session')
-      .addStringOption(o=>o.setName('type').setDescription('Exact or range').setRequired(true))
-      .addStringOption(o=>o.setName('timezone').setDescription('EST or PST').setRequired(true))
+      .addStringOption(o=>o.setName('type').setDescription('Exact or range').setRequired(true)
+        .addChoices({name:'Exact',value:'exact'},{name:'Range',value:'range'}))
+      .addStringOption(o=>o.setName('timezone').setDescription('EST or PST').setRequired(true)
+        .addChoices({name:'EST',value:'EST'},{name:'PST',value:'PST'}))
       .addStringOption(o=>o.setName('time').setDescription('Exact time HH:MM or earliest HH:MM').setRequired(true))
       .addStringOption(o=>o.setName('end-time').setDescription('Latest time for range').setRequired(false))
       .addStringOption(o=>o.setName('description').setDescription('Optional description').setRequired(false)).toJSON(),
@@ -108,7 +110,8 @@ async function checkSchedules(){
   const channel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID).catch(()=>null);
   if(!channel) return;
   for(const s of schedules){
-    if(!s.notified && now >= s.startTime-5*60000){
+    // 5-minute exact ping before start only
+    if(!s.notified && now >= new Date(s.startTime.getTime()-5*60000) && now<s.startTime){
       s.notified = true;
       channel.send(`<@${s.userId}> ⚡ Your scheduled session "${s.desc}" starts in 5 minutes!`);
     }
@@ -190,24 +193,28 @@ client.on('interactionCreate',async interaction=>{
       const desc = interaction.options.getString('description')||'Session';
       const time = interaction.options.getString('time');
       const endTime = interaction.options.getString('end-time');
-      const id = Date.now().toString(); // unique id
+
+      const id = Date.now().toString();
       const sched = {id,userId:interaction.user.id,userTag:interaction.user.tag,type,timezone:tz,desc,signups:new Set(),notified:false};
+
       if(type==='exact'){
-        const [h,m]=time.split(':').map(Number);
+        const [h,m] = time.split(':').map(Number);
         sched.startTime = new Date();
         sched.startTime.setHours(h-(tz==='EST'?5:8),m,0,0);
-      } else if(type==='range'){
+      } else {
+        // range
         const [h1,m1]=time.split(':').map(Number);
         const [h2,m2]=endTime.split(':').map(Number);
-        sched.startTime = new Date(); sched.startTime.setHours(h1-(tz==='EST'?5:8),m1,0,0);
-        sched.endTime = new Date(); sched.endTime.setHours(h2-(tz==='EST'?5:8),m2,0,0);
-      } else return interaction.editReply('❌ Invalid type.');
+        sched.startTime=new Date(); sched.startTime.setHours(h1-(tz==='EST'?5:8),m1,0,0);
+        sched.endTime=new Date(); sched.endTime.setHours(h2-(tz==='EST'?5:8),m2,0,0);
+      }
+
       schedules.push(sched);
 
       const embed = new EmbedBuilder()
         .setTitle('📅 New Scheduled Session')
         .setColor(0x00AAFF)
-        .setDescription(`Hosted by: ${interaction.user.tag}\nType: ${type}\nTimezone: ${tz}\nDescription: ${desc}\nStarts: ${sched.startTime.toUTCString()}` )
+        .setDescription(`Hosted by: ${interaction.user.tag}\nType: ${type}\nTimezone: ${tz}\nDescription: ${desc}\nStarts: ${sched.startTime.toUTCString()}${sched.endTime?`\nEnds: ${sched.endTime.toUTCString()}`:''}`)
         .setFooter({text:`Signups: 0`});
       const btn = new ButtonBuilder().setCustomId(`signup-${id}`).setLabel('Sign Up').setStyle(ButtonStyle.Success);
       const row = new ActionRowBuilder().addComponents(btn);
@@ -217,7 +224,10 @@ client.on('interactionCreate',async interaction=>{
 
     if(interaction.commandName==='view-schedule'){
       if(schedules.length===0) return interaction.editReply('No upcoming sessions.');
-      const text = schedules.map(s=>`• ${s.startTime.toUTCString()} - ${s.userTag} - ${s.desc} (Signups: ${s.signups.size})`).join('\n');
+      const text = schedules.map(s=>{
+        const range=s.endTime?`${s.startTime.toUTCString()} - ${s.endTime.toUTCString()}`:`in: ${s.startTime.toUTCString()}`;
+        return `• ${range} - ${s.userTag} - ${s.desc} (Signups: ${s.signups.size})`;
+      }).join('\n');
       return interaction.editReply(`📅 Upcoming sessions:\n${text}`);
     }
 
@@ -304,11 +314,10 @@ client.on('interactionCreate',async interaction=>{
       const embed=new EmbedBuilder().setColor(0xff9900).setDescription(`❗ ${interaction.user} has switched servers!\nJoin at: ${gameLink}! 🔔`).setTimestamp();
       await channel.send({content:'@everyone',embeds:[embed],components:[row]});
       logs.push({timestamp:Date.now(),text:`${interaction.user.tag} server hopped`});
-      return interaction.editReply('✅ Server hop announced.');
+      return interaction.editReply('✅ Server hop sent.');
     }
 
     if(interaction.commandName==='ssd'){
-      await channel.send('The session has shutdown.');
       if(sessionInterval) clearInterval(sessionInterval);
       sessionInterval=null;
       sessionStartTime=null;
@@ -321,12 +330,12 @@ client.on('interactionCreate',async interaction=>{
 });
 
 // -------------------- GLOBAL ERROR HANDLER --------------------
-process.on('unhandledRejection',async err=>{
-  console.error('Unhandled rejection:',err);
+process.on('unhandledRejection', async err=>{
+  console.error('Unhandled promise rejection:', err);
   await setDowntimeStatus();
 });
 
 client.login(TOKEN).catch(async err=>{
-  console.error('Login failed:',err);
+  console.error('Login failed:', err);
   await setDowntimeStatus();
 });
