@@ -25,6 +25,8 @@ const client = new Client({
 });
 
 let botReady = false;
+let sessionStartTime = null;
+let sessionInterval = null;
 
 /* ================= STATUS SYSTEM ================= */
 
@@ -45,6 +47,29 @@ async function setDowntimeStatus() {
         status: 'dnd',
         activities: [{
             name: '📕 Experiencing Downtime!',
+            type: ActivityType.Playing
+        }]
+    });
+}
+
+async function updateSessionStatus() {
+    if (!client.user || !sessionStartTime) return;
+
+    const elapsed = Date.now() - sessionStartTime;
+
+    const hours = Math.floor(elapsed / 3600000);
+    const minutes = Math.floor((elapsed % 3600000) / 60000);
+    const seconds = Math.floor((elapsed % 60000) / 1000);
+
+    const formatted =
+        `${String(hours).padStart(2, '0')}:` +
+        `${String(minutes).padStart(2, '0')}:` +
+        `${String(seconds).padStart(2, '0')}`;
+
+    await client.user.setPresence({
+        status: 'online',
+        activities: [{
+            name: `Server Online since: ${formatted}`,
             type: ActivityType.Playing
         }]
     });
@@ -86,6 +111,11 @@ client.once('ready', async () => {
                     .setDescription('New server link')
                     .setRequired(true)
             )
+            .toJSON(),
+
+        new SlashCommandBuilder()
+            .setName('ssd')
+            .setDescription('Shut down the current session')
             .toJSON()
     ];
 
@@ -115,16 +145,15 @@ client.on('interactionCreate', async (interaction) => {
 `🛠 **Commands:**
 • /help — Shows this menu
 • /ssu — Announces an SSU (Restricted)
-• /server-hop — Announces a server switch (Restricted)`,
+• /server-hop — Announces a server switch (Restricted)
+• /ssd — Ends the active session (Restricted)`,
                 ephemeral: true
             });
         }
 
         await interaction.deferReply({ ephemeral: true });
 
-        // Proper full member fetch
         const member = await interaction.guild.members.fetch(interaction.user.id);
-
         const hasRole = ALLOWED_ROLES.some(roleId =>
             member.roles.cache.has(roleId)
         );
@@ -133,66 +162,111 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.editReply('❌ You do not have permission to use this command.');
         }
 
-        const gameLink = interaction.options.getString('game-link');
-
-        // URL validation
-        if (!gameLink || !gameLink.startsWith('https://')) {
-            return interaction.editReply('❌ Invalid link. Must start with https://');
-        }
-
-        let channel = interaction.guild.channels.cache.get(ANNOUNCE_CHANNEL_ID);
-        if (!channel) {
-            channel = await interaction.guild.channels.fetch(ANNOUNCE_CHANNEL_ID);
-        }
-
+        const channel = await interaction.guild.channels.fetch(ANNOUNCE_CHANNEL_ID);
         if (!channel) {
             return interaction.editReply('❌ Announcement channel not found.');
         }
 
-        const button = new ButtonBuilder()
-            .setLabel('Join Server')
-            .setStyle(ButtonStyle.Link)
-            .setURL(gameLink);
-
-        const row = new ActionRowBuilder().addComponents(button);
-
-        let embed;
+        /* ===== SSU START ===== */
 
         if (interaction.commandName === 'ssu') {
-            embed = new EmbedBuilder()
+
+            const gameLink = interaction.options.getString('game-link');
+
+            if (!gameLink || !gameLink.startsWith('https://')) {
+                return interaction.editReply('❌ Invalid link. Must start with https://');
+            }
+
+            const button = new ButtonBuilder()
+                .setLabel('Join Server')
+                .setStyle(ButtonStyle.Link)
+                .setURL(gameLink);
+
+            const row = new ActionRowBuilder().addComponents(button);
+
+            const embed = new EmbedBuilder()
                 .setColor(0xff0000)
                 .setDescription(
                     `❗ A SSU is being hosted by ${interaction.user}!\n\n` +
                     `Please join the labs using this link: ${gameLink}! 🔔`
                 )
                 .setTimestamp();
+
+            await channel.send({
+                content: '@everyone',
+                embeds: [embed],
+                components: [row]
+            });
+
+            // Start session timer
+            sessionStartTime = Date.now();
+
+            if (sessionInterval) clearInterval(sessionInterval);
+
+            await updateSessionStatus();
+            sessionInterval = setInterval(updateSessionStatus, 15000);
+
+            return interaction.editReply('✅ SSU started and session timer activated.');
         }
 
+        /* ===== SERVER HOP ===== */
+
         if (interaction.commandName === 'server-hop') {
-            embed = new EmbedBuilder()
+
+            const gameLink = interaction.options.getString('game-link');
+
+            if (!gameLink || !gameLink.startsWith('https://')) {
+                return interaction.editReply('❌ Invalid link. Must start with https://');
+            }
+
+            const button = new ButtonBuilder()
+                .setLabel('Join Server')
+                .setStyle(ButtonStyle.Link)
+                .setURL(gameLink);
+
+            const row = new ActionRowBuilder().addComponents(button);
+
+            const embed = new EmbedBuilder()
                 .setColor(0xff9900)
                 .setDescription(
                     `❗ ${interaction.user} has switched servers!\n\n` +
                     `Join at: ${gameLink}! 🔔`
                 )
                 .setTimestamp();
+
+            await channel.send({
+                content: '@everyone',
+                embeds: [embed],
+                components: [row]
+            });
+
+            return interaction.editReply('✅ Server hop announced.');
         }
 
-        await channel.send({
-            content: '@everyone',
-            embeds: [embed],
-            components: [row]
-        });
+        /* ===== SSD END ===== */
 
-        await interaction.editReply('✅ Announcement sent.');
+        if (interaction.commandName === 'ssd') {
+
+            await channel.send('The session has shutdown.');
+
+            // Stop timer
+            if (sessionInterval) {
+                clearInterval(sessionInterval);
+                sessionInterval = null;
+            }
+
+            sessionStartTime = null;
+
+            await setNormalStatus();
+
+            return interaction.editReply('✅ Session ended and timer stopped.');
+        }
 
     } catch (err) {
         console.error('Command error:', err);
 
         if (botReady) {
-            try {
-                await setDowntimeStatus();
-            } catch {}
+            try { await setDowntimeStatus(); } catch {}
         }
 
         if (!interaction.replied) {
