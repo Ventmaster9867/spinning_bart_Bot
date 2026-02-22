@@ -204,19 +204,15 @@ client.on('interactionCreate',async interaction=>{
             return interaction.editReply(`📖 Logs:\n${text}`);
         }
 
-        // -------------------- CODE ALERTS (VC TEXT CHANNEL) --------------------
+        // -------------------- CODE ALERTS (VC BUILT-IN TEXT CHANNEL) --------------------
         if(interaction.commandName==='code-red' || interaction.commandName==='code-orange'){
             const location = interaction.options.getString('location');
             const vc = member.voice.channel;
             if(!vc) return interaction.editReply({ content: '❌ You must be in a voice channel to call this code!', ephemeral: true });
 
-            // Find linked text channel with the same name as the VC
-            const linkedText = vc.guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name.toLowerCase().includes(vc.name.toLowerCase()));
-            if(!linkedText) return interaction.editReply({ content: '❌ Could not find a linked text channel for this VC!', ephemeral: true });
-
-            const codeType = interaction.commandName==='code-red'?'Code Red':'Code Orange';
-            await linkedText.send(`${codeType} called by ${interaction.user.username} at ${location}!`);
-            return interaction.editReply({ content: `✅ ${codeType} sent in the VC text channel "${linkedText.name}".`, ephemeral: true });
+            const codeType = interaction.commandName==='code-red' ? 'Code Red' : 'Code Orange';
+            await vc.send(`${codeType} called by ${interaction.user.username} at ${location}!`);
+            return interaction.editReply({ content: `✅ ${codeType} sent in the VC text channel for "${vc.name}".`, ephemeral: true });
         }
 
         // -------------------- SESSION COMMANDS --------------------
