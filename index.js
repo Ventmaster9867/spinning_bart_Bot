@@ -1,9 +1,9 @@
-const { 
-    Client, 
-    GatewayIntentBits, 
-    ActivityType, 
-    REST, 
-    Routes, 
+const {
+    Client,
+    GatewayIntentBits,
+    ActivityType,
+    REST,
+    Routes,
     SlashCommandBuilder,
     EmbedBuilder,
     ButtonBuilder,
@@ -13,7 +13,7 @@ const {
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
-const SSU_CHANNEL_ID = '1452777822618648678';
+const ANNOUNCE_CHANNEL_ID = '1452777822618648678';
 
 const ALLOWED_ROLES = [
     '1410771734700888064',
@@ -24,21 +24,43 @@ const client = new Client({
     intents: [GatewayIntentBits.Guilds]
 });
 
-async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', status = 'idle') {
-    try {
-        await client.user.setPresence({
-            status: status,
-            activities: [{ name: statusText, type: ActivityType.Playing }]
-        });
-        console.log('Status set:', statusText);
-    } catch (err) {
-        console.error('Failed to set status:', err);
-    }
+let botReady = false;
+
+/* ================= STATUS SYSTEM ================= */
+
+async function setNormalStatus() {
+    if (!client.user) return;
+    await client.user.setPresence({
+        status: 'idle',
+        activities: [{
+            name: 'Created by ventmaster9867 ✨',
+            type: ActivityType.Playing
+        }]
+    });
 }
+
+async function setDowntimeStatus() {
+    if (!client.user) return;
+    await client.user.setPresence({
+        status: 'dnd',
+        activities: [{
+            name: '📕 Experiencing Downtime!',
+            type: ActivityType.Playing
+        }]
+    });
+}
+
+/* ================= READY EVENT ================= */
 
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
-    await safeSetStatus();
+    botReady = true;
+
+    try {
+        await setNormalStatus();
+    } catch (err) {
+        console.error('Status set failed on startup:', err);
+    }
 
     const commands = [
         new SlashCommandBuilder()
@@ -50,8 +72,7 @@ client.once('ready', async () => {
             .setName('ssu')
             .setDescription('Announce an SSU session')
             .addStringOption(option =>
-                option
-                    .setName('game-link')
+                option.setName('game-link')
                     .setDescription('Link to the game')
                     .setRequired(true)
             )
@@ -61,17 +82,15 @@ client.once('ready', async () => {
             .setName('server-hop')
             .setDescription('Announce a server switch')
             .addStringOption(option =>
-                option
-                    .setName('game-link')
+                option.setName('game-link')
                     .setDescription('New server link')
                     .setRequired(true)
             )
             .toJSON()
     ];
 
-    const rest = new REST({ version: '10' }).setToken(TOKEN);
-
     try {
+        const rest = new REST({ version: '10' }).setToken(TOKEN);
         await rest.put(
             Routes.applicationGuildCommands(client.user.id, GUILD_ID),
             { body: commands }
@@ -79,41 +98,46 @@ client.once('ready', async () => {
         console.log('Slash commands registered.');
     } catch (err) {
         console.error('Slash command registration failed:', err);
-        await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+        await setDowntimeStatus();
     }
 });
 
-client.on('interactionCreate', async interaction => {
+/* ================= COMMAND HANDLER ================= */
+
+client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
-    const member = interaction.member;
-    const hasRole = ALLOWED_ROLES.some(roleId =>
-        member.roles.cache.has(roleId)
-    );
-
-    if (interaction.commandName === 'help') {
-        const helpText = [
-            '🛠 **Commands:**',
-            '• `/help` — Shows this menu',
-            '• `/ssu` — Announces an SSU (Restricted)',
-            '• `/server-hop` — Announces a server switch (Restricted)'
-        ].join('\n');
-
-        return interaction.reply({ content: helpText, ephemeral: true });
-    }
-
-    if (!hasRole) {
-        return interaction.reply({
-            content: '❌ You do not have permission to use this command.',
-            ephemeral: true
-        });
-    }
-
     try {
-        const gameLink = interaction.options.getString('game-link');
-        const targetChannel = await client.channels.fetch(SSU_CHANNEL_ID);
 
-        if (!targetChannel) {
+        if (interaction.commandName === 'help') {
+            return interaction.reply({
+                content:
+`🛠 **Commands:**
+• /help — Shows this menu
+• /ssu — Announces an SSU (Restricted)
+• /server-hop — Announces a server switch (Restricted)`,
+                ephemeral: true
+            });
+        }
+
+        // Proper full member fetch (prevents partial crash)
+        const member = await interaction.guild.members.fetch(interaction.user.id);
+
+        const hasRole = ALLOWED_ROLES.some(roleId =>
+            member.roles.cache.has(roleId)
+        );
+
+        if (!hasRole) {
+            return interaction.reply({
+                content: '❌ You do not have permission to use this command.',
+                ephemeral: true
+            });
+        }
+
+        const gameLink = interaction.options.getString('game-link');
+
+        const channel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID);
+        if (!channel) {
             return interaction.reply({
                 content: '❌ Announcement channel not found.',
                 ephemeral: true
@@ -149,7 +173,7 @@ client.on('interactionCreate', async interaction => {
                 .setTimestamp();
         }
 
-        await targetChannel.send({
+        await channel.send({
             content: '@everyone',
             embeds: [embed],
             components: [row]
@@ -161,24 +185,47 @@ client.on('interactionCreate', async interaction => {
         });
 
     } catch (err) {
-        console.error('Command failed:', err);
-        await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+        console.error('Command error:', err);
+
+        if (botReady) {
+            try {
+                await setDowntimeStatus();
+            } catch (statusErr) {
+                console.error('Downtime status failed:', statusErr);
+            }
+        }
 
         if (!interaction.replied) {
             await interaction.reply({
                 content: '❌ Something went wrong.',
                 ephemeral: true
-            });
+            }).catch(() => {});
         }
     }
 });
 
+/* ================= GLOBAL ERROR SAFETY ================= */
+
 process.on('unhandledRejection', async (err) => {
-    console.error('Unhandled promise rejection:', err);
-    if (client.user) await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+    console.error('Unhandled rejection:', err);
+    if (botReady) {
+        try {
+            await setDowntimeStatus();
+        } catch {}
+    }
 });
 
-client.login(TOKEN).catch(async err => {
-    console.error('Failed to login:', err);
-    if (client.user) await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+process.on('uncaughtException', async (err) => {
+    console.error('Uncaught exception:', err);
+    if (botReady) {
+        try {
+            await setDowntimeStatus();
+        } catch {}
+    }
+});
+
+/* ================= LOGIN ================= */
+
+client.login(TOKEN).catch(err => {
+    console.error('Login failed:', err);
 });
