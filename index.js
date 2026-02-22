@@ -16,16 +16,20 @@ const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
 const ANNOUNCE_CHANNEL_ID = '1452777822618648678';
 const WHITELIST_ROLES = ['1410771734700888064','1395231118537523220'];
+const MAINT_USER_ID = '1166915839992270930';
+const SHIFT_ROLE_ID = '1475191266084917298';
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates] });
 
 // -------------------- DATA --------------------
 let schedules = []; // {id,userTag,type,startTime,endTime?,desc,signups:Set,notified,userId}
 let botReady = false;
+let maintenanceMode = false;
 
 // -------------------- STATUS --------------------
 async function setNormalStatus() {
   if (!client.user) return;
+  if(maintenanceMode) return;
   await client.user.setPresence({
     status: 'idle',
     activities: [{ name: 'Created by ventmaster9867 ✨', type: ActivityType.Playing }]
@@ -36,6 +40,13 @@ async function setDowntimeStatus() {
   await client.user.setPresence({
     status: 'dnd',
     activities: [{ name: '📕 Experiencing Downtime!', type: ActivityType.Playing }]
+  });
+}
+async function setMaintenanceStatus() {
+  if (!client.user) return;
+  await client.user.setPresence({
+    status: 'dnd',
+    activities: [{ name: '📕 Maintenance Active', type: ActivityType.Playing }]
   });
 }
 
@@ -57,7 +68,8 @@ client.once('ready', async ()=>{
       .addStringOption(o=>o.setName('description').setDescription('Optional description').setRequired(false)).toJSON(),
     new SlashCommandBuilder().setName('del-schedule').setDescription('Delete a scheduled session')
       .addStringOption(o=>o.setName('session-id').setDescription('Session ID to delete').setRequired(true)).toJSON(),
-    new SlashCommandBuilder().setName('view-schedule').setDescription('View upcoming sessions').toJSON()
+    new SlashCommandBuilder().setName('view-schedule').setDescription('View upcoming sessions').toJSON(),
+    new SlashCommandBuilder().setName('maintenance').setDescription('Toggle maintenance mode').toJSON()
   ];
 
   try {
@@ -75,7 +87,6 @@ function parseTimeToUTC(timeStr, tz){
   if(tz==='PST') date.setUTCHours(h + 8, m, 0, 0);
   return date;
 }
-
 function formatTime24(date, offset){
   const d = new Date(date.getTime() + offset*3600000);
   const hh = String(d.getUTCHours()).padStart(2,'0');
@@ -87,6 +98,9 @@ function formatTime24(date, offset){
 client.on('interactionCreate', async interaction=>{
   if(!interaction.isChatInputCommand()) return;
   try{
+    // MAINTENANCE MODE BLOCK
+    if(maintenanceMode && interaction.commandName!=='maintenance') return interaction.reply({content:'⚠️ Bot is in maintenance mode.', ephemeral:true});
+
     const member = await interaction.guild.members.fetch(interaction.user.id);
     const hasRole = WHITELIST_ROLES.some(r=>member.roles.cache.has(r));
     await interaction.deferReply({ephemeral:true});
@@ -95,7 +109,20 @@ client.on('interactionCreate', async interaction=>{
 
     // ---------- HELP ----------
     if(interaction.commandName==='help'){
-      return interaction.editReply(`🛠 Commands:\n• /help\n• /schedule (restricted)\n• /del-schedule (restricted)\n• /view-schedule`);
+      return interaction.editReply(`🛠 Commands:\n• /help\n• /schedule (restricted)\n• /del-schedule (restricted)\n• /view-schedule\n• /maintenance (restricted)`);
+    }
+
+    // ---------- MAINTENANCE ----------
+    if(interaction.commandName==='maintenance'){
+      if(interaction.user.id!==MAINT_USER_ID) return interaction.editReply('❌ No permission.');
+      maintenanceMode = !maintenanceMode;
+      if(maintenanceMode){
+        await setMaintenanceStatus();
+        return interaction.editReply('✅ Maintenance mode enabled.');
+      } else {
+        await setNormalStatus();
+        return interaction.editReply('✅ Maintenance mode disabled.');
+      }
     }
 
     // ---------- SCHEDULE ----------
@@ -191,6 +218,9 @@ client.on('interactionCreate', async interaction=>{
         const sched = schedules.find(s=>s.id===sid);
         if(!sched) return interaction.reply({content:'❌ Session not found.',ephemeral:true});
         sched.signups.add(interaction.user.id);
+        // Give shift role
+        const guildMember = await interaction.guild.members.fetch(interaction.user.id);
+        if(guildMember) guildMember.roles.add(SHIFT_ROLE_ID).catch(()=>{});
         await interaction.reply({content:`✅ You signed up for "${sched.desc}"`,ephemeral:true});
         const message = await interaction.channel.messages.fetch(interaction.message.id);
         const embed = EmbedBuilder.from(message.embeds[0]);
