@@ -1,21 +1,40 @@
-const { REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ActivityType, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const cron = require('node-cron');
 
-// -----------------------------
-// Slash Command Registration
-// -----------------------------
-const commands = [
-    new SlashCommandBuilder()
-        .setName('bart-spawn')
-        .setDescription('Spawns 3 Bart stare GIFs in this channel')
-        .toJSON()
-];
-
-const rest = new REST({ version: '10' }).setToken(TOKEN);
-
-// Replace with your server ID
+const TOKEN = process.env.TOKEN;
+const CHANNEL_ID = '1395225224081051668';
 const GUILD_ID = '1394380681341173810';
 
-(async () => {
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const cooldowns = new Map();
+
+async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', status = 'idle') {
+    try {
+        await client.user.setPresence({
+            status: status,
+            activities: [{ name: statusText, type: ActivityType.Playing }]
+        });
+        console.log('Status set:', statusText);
+    } catch (err) {
+        console.error('Failed to set status:', err);
+    }
+}
+
+client.once('ready', async () => {
+    console.log(`Logged in as ${client.user.tag}`);
+
+    // Normal operation status
+    await safeSetStatus();
+
+    // Register slash commands safely
+    const commands = [
+        new SlashCommandBuilder()
+            .setName('bart-spawn')
+            .setDescription('Spawns 3 Bart stare GIFs in this channel')
+            .toJSON()
+    ];
+
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
     try {
         console.log('Registering slash commands...');
         await rest.put(
@@ -24,25 +43,32 @@ const GUILD_ID = '1394380681341173810';
         );
         console.log('Slash commands registered.');
     } catch (err) {
-        console.error(err);
+        console.error('Slash command registration failed:', err);
+        await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
     }
-})();
 
-// -----------------------------
-// Cooldown Map
-// -----------------------------
-const cooldowns = new Map();
+    // Daily 4PM EST Bart GIF
+    cron.schedule('0 16 * * *', async () => {
+        try {
+            const channel = await client.channels.fetch(CHANNEL_ID);
+            if (!channel) return console.warn('Daily GIF channel not found:', CHANNEL_ID);
+            await channel.send('https://tenor.com/view/bart-simpson-bart-stare-simpsons-jgmm-capcut-spin-filter-gif-11221581157512010324');
+            console.log('Daily Bart stare sent.');
+        } catch (err) {
+            console.error('Failed to send daily GIF:', err);
+            await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+        }
+    }, { timezone: 'America/New_York' });
+});
 
-// -----------------------------
-// Interaction Listener
-// -----------------------------
+// Slash command interaction handler
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName === 'bart-spawn') {
         const userId = interaction.user.id;
         const now = Date.now();
-        const cooldownAmount = 60 * 1000; // 1 minute in ms
+        const cooldownAmount = 60 * 1000; // 1 minute
 
         if (cooldowns.has(userId) && now - cooldowns.get(userId) < cooldownAmount) {
             return interaction.reply({ content: '⏱ You need to wait 1 minute before using this again.', ephemeral: true });
@@ -59,7 +85,19 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ content: '🎉 Bart has been spawned 3 times!', ephemeral: true });
         } catch (err) {
             console.error('Failed to send Bart GIFs:', err);
+            await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
             await interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
         }
     }
+});
+
+// Catch all unhandled promise rejections
+process.on('unhandledRejection', async (err) => {
+    console.error('Unhandled promise rejection:', err);
+    if (client.user) await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+});
+
+client.login(TOKEN).catch(async err => {
+    console.error('Failed to login. Check TOKEN variable:', err);
+    if (client.user) await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
 });
