@@ -1,7 +1,22 @@
-const { Client, GatewayIntentBits, ActivityType, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { 
+    Client, 
+    GatewayIntentBits, 
+    ActivityType, 
+    REST, 
+    Routes, 
+    SlashCommandBuilder,
+    EmbedBuilder,
+    PermissionFlagsBits
+} = require('discord.js');
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
+const SSU_CHANNEL_ID = '1452777822618648678';
+
+const ALLOWED_ROLES = [
+    '1410771734700888064',
+    '1395231118537523220'
+];
 
 const client = new Client({
     intents: [
@@ -29,6 +44,17 @@ client.once('ready', async () => {
         new SlashCommandBuilder()
             .setName('help')
             .setDescription('Shows the command menu and info')
+            .toJSON(),
+
+        new SlashCommandBuilder()
+            .setName('ssu')
+            .setDescription('Announce an SSU session')
+            .addStringOption(option =>
+                option
+                    .setName('game-link')
+                    .setDescription('Link to the game')
+                    .setRequired(true)
+            )
             .toJSON()
     ];
 
@@ -53,14 +79,64 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === 'help') {
         const helpText = [
             '🛠 **Commands:**',
-            '• `/help` — Shows this menu'
+            '• `/help` — Shows this menu',
+            '• `/ssu` — Announces an SSU (Restricted)'
         ].join('\n');
 
+        return interaction.reply({ content: helpText, ephemeral: true });
+    }
+
+    if (interaction.commandName === 'ssu') {
         try {
-            await interaction.reply({ content: helpText, ephemeral: true });
+            const member = interaction.member;
+            const hasRole = ALLOWED_ROLES.some(roleId =>
+                member.roles.cache.has(roleId)
+            );
+
+            if (!hasRole) {
+                return interaction.reply({
+                    content: '❌ You do not have permission to use this command.',
+                    ephemeral: true
+                });
+            }
+
+            const gameLink = interaction.options.getString('game-link');
+
+            const targetChannel = await client.channels.fetch(SSU_CHANNEL_ID);
+            if (!targetChannel) {
+                return interaction.reply({
+                    content: '❌ SSU announcement channel not found.',
+                    ephemeral: true
+                });
+            }
+
+            const embed = new EmbedBuilder()
+                .setColor(0xff0000)
+                .setDescription(
+                    `❗ A SSU is being hosted by ${interaction.user}!\n\n` +
+                    `Please join the labs using this link: ${gameLink}! 🔔`
+                )
+                .setTimestamp();
+
+            await targetChannel.send({
+                content: '@everyone',
+                embeds: [embed]
+            });
+
+            await interaction.reply({
+                content: '✅ SSU announcement sent.',
+                ephemeral: true
+            });
+
         } catch (err) {
-            console.error('Help command failed:', err);
+            console.error('SSU command failed:', err);
             await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+            if (!interaction.replied) {
+                await interaction.reply({
+                    content: '❌ Something went wrong.',
+                    ephemeral: true
+                });
+            }
         }
     }
 });
