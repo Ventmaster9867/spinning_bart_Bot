@@ -17,21 +17,12 @@ const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
 const ANNOUNCE_CHANNEL_ID = '1452777822618648678';
 const WHITELIST_ROLES = ['1410771734700888064','1395231118537523220'];
-const SHIFT_ROLE_ID = '1475191266084917298';
-const LOG_ROLE_ID = '1395209235389743114';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 
 // -------------------- DATA --------------------
+let schedules = []; // {id,userTag,type,startTime,endTime?,desc,signups:Set,notified,userId}
 let botReady = false;
-let sessionStartTime = null;
-let sessionInterval = null;
-
-const schedules = []; // {id,userTag,type,startTime,endTime?,timezone,desc,signups:Set,notified,userId}
-const activeShifts = new Map(); // userId -> {startTime,roleActive}
-const activity = new Map(); // userId -> seconds
-const grandActivity = new Map(); // userId -> seconds across all weeks
-const logs = []; // {timestamp,text}
 
 // -------------------- STATUS --------------------
 async function setNormalStatus() {
@@ -46,17 +37,6 @@ async function setDowntimeStatus() {
   await client.user.setPresence({
     status: 'dnd',
     activities: [{ name: '📕 Experiencing Downtime!', type: ActivityType.Playing }]
-  });
-}
-async function updateSessionStatus() {
-  if (!client.user || !sessionStartTime) return;
-  const elapsed = Date.now() - sessionStartTime;
-  const hrs = Math.floor(elapsed / 3600000);
-  const mins = Math.floor((elapsed % 3600000) / 60000);
-  const sec = Math.floor((elapsed % 60000) / 1000);
-  await client.user.setPresence({
-    status: 'online',
-    activities: [{ name: `Server Online since: ${String(hrs).padStart(2,'0')}:${String(mins).padStart(2,'0')}:${String(sec).padStart(2,'0')}`, type: ActivityType.Playing }]
   });
 }
 
@@ -86,20 +66,14 @@ client.once('ready', async ()=>{
     await rest.put(Routes.applicationGuildCommands(client.user.id,GUILD_ID),{body:commands});
     console.log('Slash commands registered.');
   } catch(err){ console.error(err); await setDowntimeStatus(); }
-  setInterval(checkSchedules,30*1000);
 });
 
-// -------------------- SCHEDULE HANDLER --------------------
-async function checkSchedules(){
-  const now = new Date();
-  const channel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID).catch(()=>null);
-  if(!channel) return;
-  for(const s of schedules){
-    if(!s.notified && now >= new Date(s.startTime.getTime()-5*60000) && now<s.startTime){
-      s.notified = true;
-      channel.send(`<@${s.userId}> ⚡ Your scheduled session "${s.desc}" starts in 5 minutes!`);
-    }
-  }
+// -------------------- HELPER --------------------
+function formatTime24(date, offset){
+  const d = new Date(date.getTime() + offset*3600000);
+  const hh = String(d.getUTCHours()).padStart(2,'0');
+  const mm = String(d.getUTCMinutes()).padStart(2,'0');
+  return `${hh}:${mm}`;
 }
 
 // -------------------- COMMAND HANDLER --------------------
@@ -132,23 +106,33 @@ client.on('interactionCreate',async interaction=>{
       if(type==='exact'){
         const [h,m] = time.split(':').map(Number);
         sched.startTime = new Date();
-        sched.startTime.setHours(h-(tz==='EST'?5:8),m,0,0);
+        sched.startTime.setUTCHours(h-(tz==='EST'?5:8),m,0,0);
       } else {
         const [h1,m1]=time.split(':').map(Number);
         const [h2,m2]=endTime.split(':').map(Number);
-        sched.startTime=new Date(); sched.startTime.setHours(h1-(tz==='EST'?5:8),m1,0,0);
-        sched.endTime=new Date(); sched.endTime.setHours(h2-(tz==='EST'?5:8),m2,0,0);
+        sched.startTime=new Date(); sched.startTime.setUTCHours(h1-(tz==='EST'?5:8),m1,0,0);
+        sched.endTime=new Date(); sched.endTime.setUTCHours(h2-(tz==='EST'?5:8),m2,0,0);
       }
 
       schedules.push(sched);
 
-      let descTime = type==='exact' ? `Starts at: ${sched.startTime.toUTCString()}` :
-        `Starts between: ${sched.startTime.toUTCString()} - ${sched.endTime.toUTCString()}`;
+      const startEST = formatTime24(sched.startTime,-5);
+      const startPST = formatTime24(sched.startTime,-8);
+      let descTime;
+      if(type==='exact'){
+        descTime = `Starts at: ${startEST} EST / ${startPST} PST`;
+      } else {
+        const endEST = formatTime24(sched.endTime,-5);
+        const endPST = formatTime24(sched.endTime,-8);
+        descTime = `Starts between: ${startEST}-${endEST} EST / ${startPST}-${endPST} PST`;
+      }
+
       const embed = new EmbedBuilder()
         .setTitle('📅 New Scheduled Session')
         .setColor(0x00AAFF)
-        .setDescription(`Hosted by: ${interaction.user.tag}\nType: ${type}\nTimezone: ${tz}\nDescription: ${desc}\n${descTime}`)
-        .setFooter({text:`Signups: 0`});
+        .setDescription(`Hosted by: ${interaction.user.tag}\nType: ${type}\nDescription: ${desc}\n${descTime}`)
+        .setFooter({text:`Signups: 0 | ID: ${id}`});
+
       const btn = new ButtonBuilder().setCustomId(`signup-${id}`).setLabel('Sign Up').setStyle(ButtonStyle.Success);
       const row = new ActionRowBuilder().addComponents(btn);
       await channel.send({embeds:[embed],components:[row]});
@@ -164,11 +148,10 @@ client.on('interactionCreate',async interaction=>{
       const sched = schedules[index];
       try {
         const messages = await channel.messages.fetch({limit:100});
-        const msg = messages.find(m => m.embeds.length && m.embeds[0].title==='📅 New Scheduled Session' && m.embeds[0].description.includes(sched.desc));
+        const msg = messages.find(m => m.embeds.length && m.embeds[0].title==='📅 New Scheduled Session' && m.embeds[0].footer?.text?.includes(sessionId));
         if(msg) await msg.delete();
       } catch(err){ console.warn('Failed to delete embed message:', err); }
       schedules.splice(index,1);
-      logs.push({timestamp:Date.now(),text:`${interaction.user.tag} deleted scheduled session "${sched.desc}"`});
       return interaction.editReply(`✅ Deleted scheduled session "${sched.desc}".`);
     }
 
@@ -176,17 +159,47 @@ client.on('interactionCreate',async interaction=>{
     if(interaction.commandName==='view-schedule'){
       if(schedules.length===0) return interaction.editReply('No upcoming sessions.');
       const text = schedules.map(s=>{
-        let range = s.type==='exact' ? `Starts at: ${s.startTime.toUTCString()}` :
-          `Starts between: ${s.startTime.toUTCString()} - ${s.endTime.toUTCString()}`;
-        return `• ID:${s.id} - ${range} - ${s.userTag} - ${s.desc} (Signups: ${s.signups.size})`;
+        const startEST = formatTime24(s.startTime,-5);
+        const startPST = formatTime24(s.startTime,-8);
+        if(s.type==='exact'){
+          return `• ID:${s.id} - Starts at: ${startEST} EST / ${startPST} PST - ${s.userTag} - ${s.desc} (Signups: ${s.signups.size})`;
+        } else {
+          const endEST = formatTime24(s.endTime,-5);
+          const endPST = formatTime24(s.endTime,-8);
+          return `• ID:${s.id} - Starts between: ${startEST}-${endEST} EST / ${startPST}-${endPST} PST - ${s.userTag} - ${s.desc} (Signups: ${s.signups.size})`;
+        }
       }).join('\n');
       return interaction.editReply(`📅 Upcoming sessions:\n${text}`);
     }
 
-  }catch(err){ console.error(err); await setDowntimeStatus(); interaction.editReply('❌ An error occurred.'); }
+  } catch(err){
+    console.error(err);
+    await setDowntimeStatus();
+    interaction.editReply('❌ An error occurred.');
+  }
 });
 
-// -------------------- GLOBAL ERROR HANDLER --------------------
+// -------------------- BUTTON HANDLER --------------------
+client.on('interactionCreate', async interaction=>{
+  if(interaction.type===InteractionType.MessageComponent){
+    try{
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      if(interaction.customId.startsWith('signup-')){
+        const sid = interaction.customId.split('-')[1];
+        const sched = schedules.find(s=>s.id===sid);
+        if(!sched) return interaction.reply({content:'❌ Session not found.',ephemeral:true});
+        sched.signups.add(interaction.user.id);
+        await interaction.reply({content:`✅ You signed up for "${sched.desc}"`,ephemeral:true});
+        const message = await interaction.channel.messages.fetch(interaction.message.id);
+        const embed = EmbedBuilder.from(message.embeds[0]);
+        embed.setFooter({text:`Signups: ${sched.signups.size} | ID: ${sched.id}`});
+        await message.edit({embeds:[embed]});
+      }
+    }catch(err){console.error(err);}
+  }
+});
+
+// -------------------- ERROR HANDLER --------------------
 process.on('unhandledRejection', async err=>{
   console.error('Unhandled promise rejection:', err);
   await setDowntimeStatus();
