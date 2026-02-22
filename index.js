@@ -5,9 +5,21 @@ const TOKEN = process.env.TOKEN;
 const CHANNEL_ID = '1395225224081051668';
 const GUILD_ID = '1394380681341173810';
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const cooldowns = new Map();
+const client = new Client({
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+});
 
+const cooldowns = new Map(); // For /bart-spawn per-user cooldown
+let mentionCooldown = { count: 0, timestamp: Date.now() }; // global 5-per-minute
+
+const MENTION_RESPONSES = [
+    "What do you want?",
+    "Hi",
+    "You called",
+    "Stop talking to me..."
+];
+
+// --- Helper for safe status setting ---
 async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', status = 'idle') {
     try {
         await client.user.setPresence({
@@ -22,15 +34,17 @@ async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', statu
 
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
-
-    // Normal operation status
     await safeSetStatus();
 
-    // Register slash commands safely
+    // --- Slash command registration ---
     const commands = [
         new SlashCommandBuilder()
             .setName('bart-spawn')
             .setDescription('Spawns 3 Bart stare GIFs in this channel')
+            .toJSON(),
+        new SlashCommandBuilder()
+            .setName('help')
+            .setDescription('Shows the command menu and info')
             .toJSON()
     ];
 
@@ -47,7 +61,7 @@ client.once('ready', async () => {
         await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
     }
 
-    // Daily 4PM EST Bart GIF
+    // --- Daily 4PM EST Bart GIF ---
     cron.schedule('0 16 * * *', async () => {
         try {
             const channel = await client.channels.fetch(CHANNEL_ID);
@@ -61,21 +75,21 @@ client.once('ready', async () => {
     }, { timezone: 'America/New_York' });
 });
 
-// Slash command interaction handler
+// --- Slash command interaction handler ---
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    if (interaction.commandName === 'bart-spawn') {
-        const userId = interaction.user.id;
-        const now = Date.now();
-        const cooldownAmount = 60 * 1000; // 1 minute
+    const userId = interaction.user.id;
+    const now = Date.now();
 
+    // --- /bart-spawn ---
+    if (interaction.commandName === 'bart-spawn') {
+        const cooldownAmount = 60 * 1000; // 1 minute
         if (cooldowns.has(userId) && now - cooldowns.get(userId) < cooldownAmount) {
             return interaction.reply({ content: '⏱ You need to wait 1 minute before using this again.', ephemeral: true });
         }
 
         cooldowns.set(userId, now);
-
         const gifURL = 'https://tenor.com/view/bart-simpson-bart-stare-simpsons-jgmm-capcut-spin-filter-gif-11221581157512010324';
 
         try {
@@ -89,10 +103,46 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
         }
     }
+
+    // --- /help ---
+    if (interaction.commandName === 'help') {
+        const helpText = `
+📌 **Daily Bart Info:**  
+Every day at **4:00 PM EST**, the bot automatically sends a Bart stare GIF in the designated channel.
+
+🛠 **Commands:**
+• /bart-spawn → Sends 3 Bart stare GIFs in this channel (1-minute cooldown per user)  
+• /help → Shows this menu
+        `;
+        await interaction.reply({ content: helpText, ephemeral: true });
+    }
 });
 
-// Catch all unhandled promise rejections
-process.on('unhandledRejection', async (err) => {
+// --- Mention reply handler ---
+client.on('messageCreate', async message => {
+    if (message.author.bot) return;
+    if (!message.mentions.has(client.user)) return;
+
+    // Reset mention cooldown every minute
+    if (Date.now() - mentionCooldown.timestamp > 60 * 1000) {
+        mentionCooldown.count = 0;
+        mentionCooldown.timestamp = Date.now();
+    }
+
+    if (mentionCooldown.count >= 5) return; // max 5 per minute
+    mentionCooldown.count++;
+
+    try {
+        const reply = MENTION_RESPONSES[Math.floor(Math.random() * MENTION_RESPONSES.length)];
+        await message.channel.send(reply);
+    } catch (err) {
+        console.error('Failed to send mention reply:', err);
+        await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+    }
+});
+
+// --- Catch all unhandled promise rejections ---
+process.on('unhandledRejection', async err => {
     console.error('Unhandled promise rejection:', err);
     if (client.user) await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
 });
