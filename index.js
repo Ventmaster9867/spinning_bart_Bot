@@ -9,8 +9,7 @@ const {
     ButtonBuilder,
     ButtonStyle,
     ActionRowBuilder,
-    InteractionType,
-    ChannelType
+    InteractionType
 } = require('discord.js');
 
 const {
@@ -19,16 +18,13 @@ const {
     createAudioResource,
     AudioPlayerStatus,
     VoiceConnectionStatus,
-    entersState
+    entersState,
+    StreamType
 } = require('@discordjs/voice');
 
-const gTTS = require('gtts');
-const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
-
-// Tell ffmpeg where the binary is
-process.env.FFMPEG_PATH = ffmpegPath;
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
@@ -43,26 +39,18 @@ let botReady = false;
 let sessionStartTime = null;
 let sessionInterval = null;
 
-// -------------------- DATA --------------------
-const schedules = []; // {userId,userTag,dateTime,description,notified}
-const activeShifts = new Map(); // userId -> {startTime, roleActive}
-const activity = new Map(); // userId -> totalSeconds
-const logs = []; // {timestamp, text}
+const schedules = [];
+const activeShifts = new Map();
+const activity = new Map();
+const logs = [];
 
-// -------------------- TTS VOICE ALERT --------------------
-async function speakInVC(voiceChannel, message) {
+// -------------------- PLAY ALERT IN VC --------------------
+async function playAlertInVC(voiceChannel) {
     return new Promise(async (resolve) => {
         try {
-            // Generate TTS audio file
-            const ttsFilePath = path.join(__dirname, `tts_${Date.now()}.mp3`);
-            const gtts = new gTTS(message, 'en');
+            const alertFile = path.join(__dirname, 'panic-button-sound-effect-soundboard-link.mp3');
+            console.log('Playing alert file:', alertFile);
 
-            await new Promise((res, rej) => gtts.save(ttsFilePath, err => err ? rej(err) : res()));
-
-            // Small delay to make sure file is fully written
-            await new Promise(res => setTimeout(res, 500));
-
-            // Join the voice channel
             const connection = joinVoiceChannel({
                 channelId: voiceChannel.id,
                 guildId: voiceChannel.guild.id,
@@ -71,50 +59,50 @@ async function speakInVC(voiceChannel, message) {
                 selfMute: false
             });
 
-            // Wait until the connection is ready
             await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+            console.log('Voice connection ready');
 
-            // Use ffmpeg to convert mp3 to opus stream for Discord
-            const { spawn } = require('child_process');
             const ffmpeg = spawn(ffmpegPath, [
-                '-i', ttsFilePath,
-                '-acodec', 'libopus',
-                '-f', 'opus',
+                '-i', alertFile,
+                '-af', 'volume=4',
+                '-f', 's16le',
                 '-ar', '48000',
                 '-ac', '2',
                 'pipe:1'
             ]);
 
+            ffmpeg.stderr.on('data', d => console.log('[ffmpeg]', d.toString()));
+            ffmpeg.on('error', err => console.error('[ffmpeg error]', err));
+
             const player = createAudioPlayer();
-            const resource = createAudioResource(ffmpeg.stdout);
+            const resource = createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
 
             connection.subscribe(player);
             player.play(resource);
 
-            // When finished playing, disconnect and clean up
+            console.log('Audio player started');
+
+            player.on(AudioPlayerStatus.Playing, () => console.log('Now playing alert!'));
             player.on(AudioPlayerStatus.Idle, () => {
+                console.log('Audio finished, disconnecting');
                 connection.destroy();
-                fs.unlink(ttsFilePath, () => {});
                 resolve();
             });
-
             player.on('error', err => {
                 console.error('Player error:', err);
                 connection.destroy();
-                fs.unlink(ttsFilePath, () => {});
                 resolve();
             });
 
-            // Safety timeout — disconnect after 30s no matter what
             setTimeout(() => {
+                console.log('Safety timeout — disconnecting');
                 try { connection.destroy(); } catch {}
-                try { fs.unlinkSync(ttsFilePath); } catch {}
                 resolve();
             }, 30_000);
 
         } catch (err) {
-            console.error('TTS error:', err);
-            resolve(); // Don't crash the command if TTS fails
+            console.error('playAlertInVC error:', err);
+            resolve();
         }
     });
 }
@@ -244,7 +232,6 @@ client.on('interactionCreate',async interaction=>{
             return interaction.editReply(`🛠 Commands:\n• /help\n• /ssu\n• /server-hop\n• /ssd\n• /schedule (restricted)\n• /view-schedule\n• /activity-view\n• /del-activity (restricted)\n• /logs (role required)\n• /code-red\n• /code-orange`);
         }
 
-        // -------------------- SCHEDULE --------------------
         if(interaction.commandName==='schedule'){
             if(!hasRole) return interaction.editReply('❌ No permission.');
             const timeInput = interaction.options.getString('time');
@@ -263,7 +250,6 @@ client.on('interactionCreate',async interaction=>{
             return interaction.editReply(`📅 Upcoming sessions:\n${text}`);
         }
 
-        // -------------------- ACTIVITY --------------------
         if(interaction.commandName==='activity-view'){
             if(activity.size===0) return interaction.editReply('No activity recorded.');
             const text = [...activity.entries()].map(([id,secs])=>{
@@ -291,25 +277,16 @@ client.on('interactionCreate',async interaction=>{
             return interaction.editReply(`📖 Logs:\n${text}`);
         }
 
-        // -------------------- CODE ALERTS (VC BUILT-IN TEXT + TTS) --------------------
+        // -------------------- CODE ALERTS --------------------
         if(interaction.commandName==='code-red' || interaction.commandName==='code-orange'){
             const location = interaction.options.getString('location');
             const vc = member.voice.channel;
-            if(!vc) return interaction.editReply({ content: '❌ You must be in a voice channel to call this code!', ephemeral: true });
+            if(!vc) return interaction.editReply('❌ You must be in a voice channel to call this code!');
 
             const codeType = interaction.commandName==='code-red' ? 'Code Red' : 'Code Orange';
-            const alertMessage = `${codeType} called by ${interaction.user.username} at ${location}!`;
-
-            // Send to VC built-in text channel
-            await vc.send(alertMessage);
-
-            // Reply to user immediately so the interaction doesn't time out
-            await interaction.editReply({ content: `✅ ${codeType} announced in "${vc.name}" — joining VC to speak it now...` });
-
-            // Speak the alert out loud in the VC
-            const ttsMessage = `Attention. ${codeType}. ${codeType} at ${location}. Called by ${interaction.user.username}.`;
-            await speakInVC(vc, ttsMessage);
-
+            await vc.send(`${codeType} called by ${interaction.user.username} at ${location}!`);
+            await interaction.editReply(`✅ ${codeType} announced — playing alert sound now...`);
+            await playAlertInVC(vc);
             return;
         }
 
@@ -348,14 +325,12 @@ client.on('interactionCreate',async interaction=>{
             await channel.send('The session has shutdown.');
             if(sessionInterval){clearInterval(sessionInterval);sessionInterval=null;}
             sessionStartTime=null;
-
             for(const [id,data] of activeShifts.entries()){
                 const duration = Math.floor((Date.now()-data.startTime)/1000);
                 activity.set(id,(activity.get(id)||0)+duration);
             }
             activeShifts.clear();
             await setNormalStatus();
-
             if(activity.size>0){
                 const text = [...activity.entries()].map(([id,secs])=>{
                     const hrs=Math.floor(secs/3600); const mins=Math.floor((secs%3600)/60); const s=secs%60;
@@ -370,9 +345,7 @@ client.on('interactionCreate',async interaction=>{
     }catch(err){console.error(err);if(botReady) try{await setDowntimeStatus();}catch{} if(!interaction.replied) await interaction.reply({content:'❌ Something went wrong.',ephemeral:true}).catch(()=>{});}
 });
 
-// -------------------- GLOBAL ERROR SAFETY --------------------
 process.on('unhandledRejection', async err => {console.error(err); if(botReady) try{await setDowntimeStatus();}catch{}});
 process.on('uncaughtException', async err => {console.error(err); if(botReady) try{await setDowntimeStatus();}catch{} });
 
-// -------------------- LOGIN --------------------
 client.login(TOKEN).catch(err=>console.error('Login failed:',err));
