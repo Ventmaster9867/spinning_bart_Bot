@@ -13,6 +13,19 @@ const {
     ChannelType
 } = require('discord.js');
 
+const {
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+    VoiceConnectionStatus,
+    entersState
+} = require('@discordjs/voice');
+
+const gTTS = require('gtts');
+const fs = require('fs');
+const path = require('path');
+
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
 const ANNOUNCE_CHANNEL_ID = '1452777822618648678';
@@ -31,6 +44,56 @@ const schedules = []; // {userId,userTag,dateTime,description,notified}
 const activeShifts = new Map(); // userId -> {startTime, roleActive}
 const activity = new Map(); // userId -> totalSeconds
 const logs = []; // {timestamp, text}
+
+// -------------------- TTS VOICE ALERT --------------------
+async function speakInVC(voiceChannel, message) {
+    return new Promise(async (resolve) => {
+        try {
+            // Generate TTS audio file
+            const ttsFilePath = path.join(__dirname, `tts_${Date.now()}.mp3`);
+            const gtts = new gTTS(message, 'en');
+
+            await new Promise((res, rej) => gtts.save(ttsFilePath, err => err ? rej(err) : res()));
+
+            // Join the voice channel
+            const connection = joinVoiceChannel({
+                channelId: voiceChannel.id,
+                guildId: voiceChannel.guild.id,
+                adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+                selfDeaf: false,
+                selfMute: false
+            });
+
+            // Wait until the connection is ready
+            await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+
+            // Create player and resource
+            const player = createAudioPlayer();
+            const resource = createAudioResource(ttsFilePath);
+
+            connection.subscribe(player);
+            player.play(resource);
+
+            // When finished playing, disconnect and clean up
+            player.on(AudioPlayerStatus.Idle, () => {
+                connection.destroy();
+                fs.unlink(ttsFilePath, () => {});
+                resolve();
+            });
+
+            // Safety timeout — disconnect after 30s no matter what
+            setTimeout(() => {
+                try { connection.destroy(); } catch {}
+                try { fs.unlinkSync(ttsFilePath); } catch {}
+                resolve();
+            }, 30_000);
+
+        } catch (err) {
+            console.error('TTS error:', err);
+            resolve(); // Don't crash the command if TTS fails
+        }
+    });
+}
 
 // -------------------- STATUS --------------------
 async function setNormalStatus() {
@@ -204,15 +267,26 @@ client.on('interactionCreate',async interaction=>{
             return interaction.editReply(`📖 Logs:\n${text}`);
         }
 
-        // -------------------- CODE ALERTS (VC BUILT-IN TEXT CHANNEL) --------------------
+        // -------------------- CODE ALERTS (VC BUILT-IN TEXT + TTS) --------------------
         if(interaction.commandName==='code-red' || interaction.commandName==='code-orange'){
             const location = interaction.options.getString('location');
             const vc = member.voice.channel;
             if(!vc) return interaction.editReply({ content: '❌ You must be in a voice channel to call this code!', ephemeral: true });
 
             const codeType = interaction.commandName==='code-red' ? 'Code Red' : 'Code Orange';
-            await vc.send(`${codeType} called by ${interaction.user.username} at ${location}!`);
-            return interaction.editReply({ content: `✅ ${codeType} sent in the VC text channel for "${vc.name}".`, ephemeral: true });
+            const alertMessage = `${codeType} called by ${interaction.user.username} at ${location}!`;
+
+            // Send to VC built-in text channel
+            await vc.send(alertMessage);
+
+            // Reply to user immediately so the interaction doesn't time out
+            await interaction.editReply({ content: `✅ ${codeType} announced in "${vc.name}" — joining VC to speak it now...` });
+
+            // Speak the alert out loud in the VC
+            const ttsMessage = `Attention. ${codeType}. ${codeType} at ${location}. Called by ${interaction.user.username}.`;
+            await speakInVC(vc, ttsMessage);
+
+            return;
         }
 
         // -------------------- SESSION COMMANDS --------------------
