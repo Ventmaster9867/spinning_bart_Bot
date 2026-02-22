@@ -11,7 +11,6 @@ const {
   ActionRowBuilder,
   InteractionType
 } = require('discord.js');
-const cron = require('node-cron');
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
@@ -68,7 +67,15 @@ client.once('ready', async ()=>{
   } catch(err){ console.error(err); await setDowntimeStatus(); }
 });
 
-// -------------------- HELPER --------------------
+// -------------------- HELPERS --------------------
+function parseTimeToUTC(timeStr, tz){
+  const [h,m] = timeStr.split(':').map(Number);
+  const date = new Date();
+  if(tz==='EST') date.setUTCHours(h + 5, m, 0, 0);
+  if(tz==='PST') date.setUTCHours(h + 8, m, 0, 0);
+  return date;
+}
+
 function formatTime24(date, offset){
   const d = new Date(date.getTime() + offset*3600000);
   const hh = String(d.getUTCHours()).padStart(2,'0');
@@ -77,7 +84,7 @@ function formatTime24(date, offset){
 }
 
 // -------------------- COMMAND HANDLER --------------------
-client.on('interactionCreate',async interaction=>{
+client.on('interactionCreate', async interaction=>{
   if(!interaction.isChatInputCommand()) return;
   try{
     const member = await interaction.guild.members.fetch(interaction.user.id);
@@ -104,14 +111,10 @@ client.on('interactionCreate',async interaction=>{
       const sched = {id,userId:interaction.user.id,userTag:interaction.user.tag,type,timezone:tz,desc,signups:new Set(),notified:false};
 
       if(type==='exact'){
-        const [h,m] = time.split(':').map(Number);
-        sched.startTime = new Date();
-        sched.startTime.setUTCHours(h-(tz==='EST'?5:8),m,0,0);
+        sched.startTime = parseTimeToUTC(time, tz);
       } else {
-        const [h1,m1]=time.split(':').map(Number);
-        const [h2,m2]=endTime.split(':').map(Number);
-        sched.startTime=new Date(); sched.startTime.setUTCHours(h1-(tz==='EST'?5:8),m1,0,0);
-        sched.endTime=new Date(); sched.endTime.setUTCHours(h2-(tz==='EST'?5:8),m2,0,0);
+        sched.startTime = parseTimeToUTC(time, tz);
+        sched.endTime = parseTimeToUTC(endTime, tz);
       }
 
       schedules.push(sched);
@@ -183,7 +186,6 @@ client.on('interactionCreate',async interaction=>{
 client.on('interactionCreate', async interaction=>{
   if(interaction.type===InteractionType.MessageComponent){
     try{
-      const member = await interaction.guild.members.fetch(interaction.user.id);
       if(interaction.customId.startsWith('signup-')){
         const sid = interaction.customId.split('-')[1];
         const sched = schedules.find(s=>s.id===sid);
