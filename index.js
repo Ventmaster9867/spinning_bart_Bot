@@ -6,7 +6,9 @@ const {
     Routes, 
     SlashCommandBuilder,
     EmbedBuilder,
-    PermissionFlagsBits
+    ButtonBuilder,
+    ButtonStyle,
+    ActionRowBuilder
 } = require('discord.js');
 
 const TOKEN = process.env.TOKEN;
@@ -19,9 +21,7 @@ const ALLOWED_ROLES = [
 ];
 
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds
-    ]
+    intents: [GatewayIntentBits.Guilds]
 });
 
 async function safeSetStatus(statusText = 'Created by ventmaster9867 ✨', status = 'idle') {
@@ -43,7 +43,7 @@ client.once('ready', async () => {
     const commands = [
         new SlashCommandBuilder()
             .setName('help')
-            .setDescription('Shows the command menu and info')
+            .setDescription('Shows the command menu')
             .toJSON(),
 
         new SlashCommandBuilder()
@@ -55,13 +55,23 @@ client.once('ready', async () => {
                     .setDescription('Link to the game')
                     .setRequired(true)
             )
+            .toJSON(),
+
+        new SlashCommandBuilder()
+            .setName('server-hop')
+            .setDescription('Announce a server switch')
+            .addStringOption(option =>
+                option
+                    .setName('game-link')
+                    .setDescription('New server link')
+                    .setRequired(true)
+            )
             .toJSON()
     ];
 
     const rest = new REST({ version: '10' }).setToken(TOKEN);
 
     try {
-        console.log('Registering slash commands...');
         await rest.put(
             Routes.applicationGuildCommands(client.user.id, GUILD_ID),
             { body: commands }
@@ -76,67 +86,89 @@ client.once('ready', async () => {
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
+    const member = interaction.member;
+    const hasRole = ALLOWED_ROLES.some(roleId =>
+        member.roles.cache.has(roleId)
+    );
+
     if (interaction.commandName === 'help') {
         const helpText = [
             '🛠 **Commands:**',
             '• `/help` — Shows this menu',
-            '• `/ssu` — Announces an SSU (Restricted)'
+            '• `/ssu` — Announces an SSU (Restricted)',
+            '• `/server-hop` — Announces a server switch (Restricted)'
         ].join('\n');
 
         return interaction.reply({ content: helpText, ephemeral: true });
     }
 
-    if (interaction.commandName === 'ssu') {
-        try {
-            const member = interaction.member;
-            const hasRole = ALLOWED_ROLES.some(roleId =>
-                member.roles.cache.has(roleId)
-            );
+    if (!hasRole) {
+        return interaction.reply({
+            content: '❌ You do not have permission to use this command.',
+            ephemeral: true
+        });
+    }
 
-            if (!hasRole) {
-                return interaction.reply({
-                    content: '❌ You do not have permission to use this command.',
-                    ephemeral: true
-                });
-            }
+    try {
+        const gameLink = interaction.options.getString('game-link');
+        const targetChannel = await client.channels.fetch(SSU_CHANNEL_ID);
 
-            const gameLink = interaction.options.getString('game-link');
+        if (!targetChannel) {
+            return interaction.reply({
+                content: '❌ Announcement channel not found.',
+                ephemeral: true
+            });
+        }
 
-            const targetChannel = await client.channels.fetch(SSU_CHANNEL_ID);
-            if (!targetChannel) {
-                return interaction.reply({
-                    content: '❌ SSU announcement channel not found.',
-                    ephemeral: true
-                });
-            }
+        const button = new ButtonBuilder()
+            .setLabel('Join Server')
+            .setStyle(ButtonStyle.Link)
+            .setURL(gameLink);
 
-            const embed = new EmbedBuilder()
+        const row = new ActionRowBuilder().addComponents(button);
+
+        let embed;
+
+        if (interaction.commandName === 'ssu') {
+            embed = new EmbedBuilder()
                 .setColor(0xff0000)
                 .setDescription(
                     `❗ A SSU is being hosted by ${interaction.user}!\n\n` +
                     `Please join the labs using this link: ${gameLink}! 🔔`
                 )
                 .setTimestamp();
+        }
 
-            await targetChannel.send({
-                content: '@everyone',
-                embeds: [embed]
-            });
+        if (interaction.commandName === 'server-hop') {
+            embed = new EmbedBuilder()
+                .setColor(0xff9900)
+                .setDescription(
+                    `❗ ${interaction.user} has switched servers!\n\n` +
+                    `Join at: ${gameLink}! 🔔`
+                )
+                .setTimestamp();
+        }
 
+        await targetChannel.send({
+            content: '@everyone',
+            embeds: [embed],
+            components: [row]
+        });
+
+        await interaction.reply({
+            content: '✅ Announcement sent.',
+            ephemeral: true
+        });
+
+    } catch (err) {
+        console.error('Command failed:', err);
+        await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
+
+        if (!interaction.replied) {
             await interaction.reply({
-                content: '✅ SSU announcement sent.',
+                content: '❌ Something went wrong.',
                 ephemeral: true
             });
-
-        } catch (err) {
-            console.error('SSU command failed:', err);
-            await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
-            if (!interaction.replied) {
-                await interaction.reply({
-                    content: '❌ Something went wrong.',
-                    ephemeral: true
-                });
-            }
         }
     }
 });
@@ -147,6 +179,6 @@ process.on('unhandledRejection', async (err) => {
 });
 
 client.login(TOKEN).catch(async err => {
-    console.error('Failed to login. Check TOKEN variable:', err);
+    console.error('Failed to login:', err);
     if (client.user) await safeSetStatus('📕 Experiencing Downtime!', 'dnd');
 });
