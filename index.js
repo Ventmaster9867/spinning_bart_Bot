@@ -9,8 +9,7 @@ const {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
-  InteractionType,
-  ChannelType
+  InteractionType
 } = require('discord.js');
 const cron = require('node-cron');
 
@@ -29,7 +28,7 @@ let sessionStartTime = null;
 let sessionInterval = null;
 
 const schedules = []; // {id,userTag,type,startTime,endTime?,timezone,desc,signups:Set,notified,userId}
-const activeShifts = new Map(); // userId -> {startTime, roleActive}
+const activeShifts = new Map(); // userId -> {startTime,roleActive}
 const activity = new Map(); // userId -> seconds
 const grandActivity = new Map(); // userId -> seconds across all weeks
 const logs = []; // {timestamp,text}
@@ -69,11 +68,6 @@ client.once('ready', async ()=>{
 
   const commands = [
     new SlashCommandBuilder().setName('help').setDescription('Shows command menu').toJSON(),
-    new SlashCommandBuilder().setName('ssu').setDescription('Announce an SSU')
-      .addStringOption(o=>o.setName('game-link').setDescription('Link').setRequired(true)).toJSON(),
-    new SlashCommandBuilder().setName('server-hop').setDescription('Server switch')
-      .addStringOption(o=>o.setName('game-link').setDescription('Link').setRequired(true)).toJSON(),
-    new SlashCommandBuilder().setName('ssd').setDescription('Shut down session').toJSON(),
     new SlashCommandBuilder().setName('schedule').setDescription('Schedule a session')
       .addStringOption(o=>o.setName('type').setDescription('Exact or range').setRequired(true)
         .addChoices({name:'Exact',value:'exact'},{name:'Range',value:'range'}))
@@ -84,17 +78,7 @@ client.once('ready', async ()=>{
       .addStringOption(o=>o.setName('description').setDescription('Optional description').setRequired(false)).toJSON(),
     new SlashCommandBuilder().setName('del-schedule').setDescription('Delete a scheduled session')
       .addStringOption(o=>o.setName('session-id').setDescription('Session ID to delete').setRequired(true)).toJSON(),
-    new SlashCommandBuilder().setName('view-schedule').setDescription('View upcoming sessions').toJSON(),
-    new SlashCommandBuilder().setName('activity-view').setDescription('View weekly activity leaderboard').toJSON(),
-    new SlashCommandBuilder().setName('view-activity-grand').setDescription('View grand activity leaderboard').toJSON(),
-    new SlashCommandBuilder().setName('del-activity').setDescription('Delete activity record')
-      .addUserOption(o=>o.setName('user').setDescription('Target user').setRequired(true))
-      .addStringOption(o=>o.setName('reason').setDescription('Reason').setRequired(true)).toJSON(),
-    new SlashCommandBuilder().setName('logs').setDescription('View global logs').toJSON(),
-    new SlashCommandBuilder().setName('code-red').setDescription('Call Code Red alert')
-      .addStringOption(o=>o.setName('location').setDescription('Location').setRequired(true)).toJSON(),
-    new SlashCommandBuilder().setName('code-orange').setDescription('Call Code Orange alert')
-      .addStringOption(o=>o.setName('location').setDescription('Location').setRequired(true)).toJSON()
+    new SlashCommandBuilder().setName('view-schedule').setDescription('View upcoming sessions').toJSON()
   ];
 
   try {
@@ -102,8 +86,7 @@ client.once('ready', async ()=>{
     await rest.put(Routes.applicationGuildCommands(client.user.id,GUILD_ID),{body:commands});
     console.log('Slash commands registered.');
   } catch(err){ console.error(err); await setDowntimeStatus(); }
-
-  setInterval(checkSchedules,30*1000); // every 30s
+  setInterval(checkSchedules,30*1000);
 });
 
 // -------------------- SCHEDULE HANDLER --------------------
@@ -119,56 +102,6 @@ async function checkSchedules(){
   }
 }
 
-// -------------------- WEEKLY ACTIVITY ROLLOVER --------------------
-cron.schedule('0 0 * * 6', ()=>{
-  for(const [id,secs] of activity.entries()){
-    grandActivity.set(id,(grandActivity.get(id)||0)+secs);
-  }
-  activity.clear();
-  console.log('Weekly activity rolled into grandActivity.');
-},{timezone:'America/New_York'});
-
-// -------------------- BUTTON HANDLER --------------------
-client.on('interactionCreate', async interaction=>{
-  if(interaction.type===InteractionType.MessageComponent){
-    try{
-      const member = await interaction.guild.members.fetch(interaction.user.id);
-      if(interaction.customId==='join-server'){
-        if(!member.roles.cache.has(SHIFT_ROLE_ID)){
-          await member.roles.add(SHIFT_ROLE_ID);
-          activeShifts.set(member.id,{startTime:Date.now(),roleActive:true});
-          logs.push({timestamp:Date.now(),text:`${member.user.tag} joined session via button.`});
-        }
-        await interaction.reply({content:'✅ Role assigned. Enjoy the session!',ephemeral:true});
-      }
-      if(interaction.customId==='end-shift'){
-        if(member.roles.cache.has(SHIFT_ROLE_ID)){
-          await member.roles.remove(SHIFT_ROLE_ID);
-          const shift = activeShifts.get(member.id);
-          if(shift){
-            const duration = Math.floor((Date.now()-shift.startTime)/1000);
-            activity.set(member.id,(activity.get(member.id)||0)+duration);
-            activeShifts.delete(member.id);
-            logs.push({timestamp:Date.now(),text:`${member.user.tag} ended shift, duration ${duration}s`});
-          }
-        }
-        await interaction.reply({content:'✅ Shift ended.',ephemeral:true});
-      }
-      if(interaction.customId.startsWith('signup-')){
-        const sid = interaction.customId.split('-')[1];
-        const sched = schedules.find(s=>s.id===sid);
-        if(!sched) return interaction.reply({content:'❌ Session not found.',ephemeral:true});
-        sched.signups.add(interaction.user.id);
-        await interaction.reply({content:`✅ You signed up for "${sched.desc}"`,ephemeral:true});
-        const message = await interaction.channel.messages.fetch(interaction.message.id);
-        const embed = EmbedBuilder.from(message.embeds[0]);
-        embed.setFooter({text:`Signups: ${sched.signups.size}`});
-        await message.edit({embeds:[embed]});
-      }
-    }catch(err){console.error(err);}
-  }
-});
-
 // -------------------- COMMAND HANDLER --------------------
 client.on('interactionCreate',async interaction=>{
   if(!interaction.isChatInputCommand()) return;
@@ -176,13 +109,12 @@ client.on('interactionCreate',async interaction=>{
     const member = await interaction.guild.members.fetch(interaction.user.id);
     const hasRole = WHITELIST_ROLES.some(r=>member.roles.cache.has(r));
     await interaction.deferReply({ephemeral:true});
-
     const channel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID).catch(()=>null);
     if(!channel) return interaction.editReply('❌ Announcement channel missing.');
 
     // ---------- HELP ----------
     if(interaction.commandName==='help'){
-      return interaction.editReply(`🛠 Commands:\n• /help\n• /ssu\n• /server-hop\n• /ssd\n• /schedule (restricted)\n• /del-schedule (restricted)\n• /view-schedule\n• /activity-view\n• /view-activity-grand\n• /del-activity (restricted)\n• /logs (role required)\n• /code-red\n• /code-orange`);
+      return interaction.editReply(`🛠 Commands:\n• /help\n• /schedule (restricted)\n• /del-schedule (restricted)\n• /view-schedule`);
     }
 
     // ---------- SCHEDULE ----------
@@ -210,15 +142,17 @@ client.on('interactionCreate',async interaction=>{
 
       schedules.push(sched);
 
+      let descTime = type==='exact' ? `Starts at: ${sched.startTime.toUTCString()}` :
+        `Starts between: ${sched.startTime.toUTCString()} - ${sched.endTime.toUTCString()}`;
       const embed = new EmbedBuilder()
         .setTitle('📅 New Scheduled Session')
         .setColor(0x00AAFF)
-        .setDescription(`Hosted by: ${interaction.user.tag}\nType: ${type}\nTimezone: ${tz}\nDescription: ${desc}\nStarts: ${sched.startTime.toUTCString()}${sched.endTime?`\nEnds: ${sched.endTime.toUTCString()}`:''}`)
+        .setDescription(`Hosted by: ${interaction.user.tag}\nType: ${type}\nTimezone: ${tz}\nDescription: ${desc}\n${descTime}`)
         .setFooter({text:`Signups: 0`});
       const btn = new ButtonBuilder().setCustomId(`signup-${id}`).setLabel('Sign Up').setStyle(ButtonStyle.Success);
       const row = new ActionRowBuilder().addComponents(btn);
       await channel.send({embeds:[embed],components:[row]});
-      return interaction.editReply('✅ Session scheduled.');
+      return interaction.editReply(`✅ Session scheduled with ID: ${id}`);
     }
 
     // ---------- DEL SCHEDULE ----------
@@ -227,7 +161,6 @@ client.on('interactionCreate',async interaction=>{
       const sessionId = interaction.options.getString('session-id');
       const index = schedules.findIndex(s => s.id === sessionId);
       if(index === -1) return interaction.editReply('❌ Session not found.');
-      
       const sched = schedules[index];
       try {
         const messages = await channel.messages.fetch({limit:100});
@@ -243,14 +176,12 @@ client.on('interactionCreate',async interaction=>{
     if(interaction.commandName==='view-schedule'){
       if(schedules.length===0) return interaction.editReply('No upcoming sessions.');
       const text = schedules.map(s=>{
-        const range=s.endTime?`${s.startTime.toUTCString()} - ${s.endTime.toUTCString()}`:`in: ${s.startTime.toUTCString()}`;
-        return `• ${range} - ${s.userTag} - ${s.desc} (Signups: ${s.signups.size})`;
+        let range = s.type==='exact' ? `Starts at: ${s.startTime.toUTCString()}` :
+          `Starts between: ${s.startTime.toUTCString()} - ${s.endTime.toUTCString()}`;
+        return `• ID:${s.id} - ${range} - ${s.userTag} - ${s.desc} (Signups: ${s.signups.size})`;
       }).join('\n');
       return interaction.editReply(`📅 Upcoming sessions:\n${text}`);
     }
-
-    // ---------- OTHER COMMANDS ----------
-    // ... (activity, del-activity, logs, code alerts, ssu/server-hop/ssd handled similarly as before)
 
   }catch(err){ console.error(err); await setDowntimeStatus(); interaction.editReply('❌ An error occurred.'); }
 });
