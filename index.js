@@ -12,6 +12,40 @@ const {
   InteractionType,
   PermissionFlagsBits
 } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
+
+// -------------------- PERSISTENCE --------------------
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const FILES = {
+  warnings:      path.join(DATA_DIR, 'warnings.json'),
+  weeklyActivity: path.join(DATA_DIR, 'weeklyActivity.json'),
+  modLogs:       path.join(DATA_DIR, 'modLogs.json'),
+  activeBans:    path.join(DATA_DIR, 'activeBans.json'),
+  shiftStartTimes: path.join(DATA_DIR, 'shiftStartTimes.json')
+};
+
+function loadJSON(file, fallback) {
+  try {
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) { console.error(`Failed to load ${file}:`, err.message); }
+  return fallback;
+}
+
+function saveJSON(file, data) {
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+  } catch (err) { console.error(`Failed to save ${file}:`, err.message); }
+}
+
+// Append a single mod log entry to the log file immediately (hard save)
+function appendModLog(entry) {
+  const logs = loadJSON(FILES.modLogs, []);
+  logs.push(entry);
+  saveJSON(FILES.modLogs, logs);
+}
 
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = '1394380681341173810';
@@ -49,22 +83,18 @@ const client = new Client({
 });
 
 // -------------------- DATA --------------------
-let schedules = [];
+let schedules = [];        // not persisted — session-specific
 let botReady = false;
 let maintenanceMode = false;
-let shiftStartTimes = {};
-let weeklyActivity = {};
 let activeSessionMessageId = null;
 let activeSessionChannelId = ANNOUNCE_CHANNEL_ID;
+let pendingMuteRequests = {}; // in-memory only
 
-// warnings: { userId: [ { reason, moderatorTag, moderatorId, timestamp } ] }
-let warnings = {};
-
-// pending mute approvals: { requestId: { targetId, targetTag, moderatorId, moderatorTag, reason, warnCount } }
-let pendingMuteRequests = {};
-
-// active temp bans: { userId: timeoutId } — for cleanup tracking
-let activeBans = {};
+// Persisted data — loaded from disk on startup
+let warnings       = loadJSON(FILES.warnings, {});
+let weeklyActivity = loadJSON(FILES.weeklyActivity, {});
+let shiftStartTimes = loadJSON(FILES.shiftStartTimes, {});
+let savedBans      = loadJSON(FILES.activeBans, {}); // { userId: { expiresAt } }
 
 // -------------------- STATUS --------------------
 async function setNormalStatus() {
@@ -143,11 +173,18 @@ function humanDuration(ms) {
 
 // -------------------- MOD LOGGING --------------------
 async function sendModLog(embed) {
+  // Hard save to disk immediately
+  const fields = (embed.data && embed.data.fields) ? embed.data.fields : [];
+  appendModLog({
+    timestamp: Date.now(),
+    title: (embed.data && embed.data.title) ? embed.data.title : "Mod Action",
+    fields: fields.map(f => ({ name: f.name, value: f.value }))
+  });
   try {
     const ch = await client.channels.fetch(MOD_LOG_CHANNEL_ID);
     await ch.send({ embeds: [embed] });
   } catch (err) {
-    console.error('Failed to send mod log:', err.message);
+    console.error("Failed to send mod log:", err.message);
   }
 }
 
@@ -156,14 +193,51 @@ function modLogEmbed(action, moderator, target, extra = {}) {
     .setColor(extra.color || 0xFF6600)
     .setTitle(`🛡️ ${action}`)
     .addFields(
-      { name: 'Moderator', value: `${moderator.tag} (<@${moderator.id}>)`, inline: true },
-      { name: 'Target', value: `${target.tag} (<@${target.id}>)`, inline: true }
+      { name: "Moderator", value: `${moderator.tag} (<@${moderator.id}>)`, inline: true },
+      { name: "Target", value: `${target.tag} (<@${target.id}>)`, inline: true }
     )
     .setTimestamp();
-  if (extra.reason) embed.addFields({ name: 'Reason', value: extra.reason });
-  if (extra.duration) embed.addFields({ name: 'Duration', value: extra.duration, inline: true });
-  if (extra.warnCount !== undefined) embed.addFields({ name: 'Total Warnings', value: String(extra.warnCount), inline: true });
+  if (extra.reason) embed.addFields({ name: "Reason", value: extra.reason });
+  if (extra.duration) embed.addFields({ name: "Duration", value: extra.duration, inline: true });
+  if (extra.warnCount !== undefined) embed.addFields({ name: "Total Warnings", value: String(extra.warnCount), inline: true });
   return embed;
+}
+
+// -------------------- BAN PERSISTENCE --------------------
+function scheduleBanExpiry(userId, userTag, guildId, ms) {
+  // Cap setTimeout at ~24 days (JS max safe). For longer bans, re-schedule on restart.
+  const MAX_TIMEOUT = 2073600000; // 24 days in ms
+  const delay = Math.min(ms, MAX_TIMEOUT);
+  setTimeout(async () => {
+    try {
+      const guild = await client.guilds.fetch(guildId);
+      await guild.members.unban(userId, 'Temporary ban expired');
+      console.log(`Unbanned ${userTag} after temporary ban expired.`);
+      delete savedBans[userId];
+      saveJSON(FILES.activeBans, savedBans);
+      const unbanLog = new EmbedBuilder()
+        .setTitle('🔓 Temporary Ban Expired')
+        .setColor(0x00FF00)
+        .setDescription(`<@${userId}> (${userTag}) has been unbanned after their temporary ban expired.`)
+        .setTimestamp();
+      await sendModLog(unbanLog);
+    } catch (err) { console.error('Unban failed:', err.message); }
+  }, delay);
+}
+
+// Called on bot ready — re-schedule any bans that were active before shutdown
+function restorePendingBans() {
+  const now = Date.now();
+  for (const [userId, banData] of Object.entries(savedBans)) {
+    const remaining = banData.expiresAt - now;
+    if (remaining <= 0) {
+      // Already expired while bot was offline — unban immediately
+      scheduleBanExpiry(userId, banData.tag, banData.guildId, 0);
+    } else {
+      console.log(`Restoring ban for ${banData.tag}, expires in ${Math.round(remaining/60000)}m`);
+      scheduleBanExpiry(userId, banData.tag, banData.guildId, remaining);
+    }
+  }
 }
 
 // -------------------- SCHEDULE CHECKER --------------------
@@ -213,6 +287,7 @@ function scheduleWeeklyReport() {
           try { const u = await client.users.fetch(uid); await u.send({ embeds: [metEmbed, failEmbed] }); } catch {}
         }
         weeklyActivity = {};
+        saveJSON(FILES.weeklyActivity, weeklyActivity);
       } catch (err) { console.error('Weekly report error:', err); }
     }
   }, 60 * 1000);
@@ -295,6 +370,7 @@ client.once('ready', async () => {
 
   startScheduleChecker();
   scheduleWeeklyReport();
+  restorePendingBans();
 });
 
 // -------------------- COMMAND HANDLER --------------------
@@ -448,6 +524,8 @@ client.on('interactionCreate', async interaction => {
           delete shiftStartTimes[uid];
         }
       }
+      saveJSON(FILES.weeklyActivity, weeklyActivity);
+      saveJSON(FILES.shiftStartTimes, shiftStartTimes);
       if (activeSessionMessageId) {
         try {
           const sc = await client.channels.fetch(activeSessionChannelId);
@@ -501,6 +579,7 @@ client.on('interactionCreate', async interaction => {
         moderatorId: interaction.user.id,
         timestamp: Date.now()
       });
+      saveJSON(FILES.warnings, warnings);
       const warnCount = warnings[targetUser.id].length;
 
       // DM the warned user
@@ -690,20 +769,18 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply(`❌ Failed to ban: ${err.message}`);
       }
 
+      // Save ban to disk so it survives restarts
+      savedBans[targetUser.id] = {
+        expiresAt: Date.now() + durationMs,
+        tag: targetUser.tag,
+        guildId: interaction.guild.id,
+        reason,
+        duration: humanDuration(durationMs)
+      };
+      saveJSON(FILES.activeBans, savedBans);
+
       // Schedule unban
-      setTimeout(async () => {
-        try {
-          await interaction.guild.members.unban(targetUser.id, 'Temporary ban expired');
-          console.log(`Unbanned ${targetUser.tag} after ${humanDuration(durationMs)}`);
-          const unbanLog = new EmbedBuilder()
-            .setTitle('🔓 Temporary Ban Expired')
-            .setColor(0x00FF00)
-            .setDescription(`<@${targetUser.id}> (${targetUser.tag}) has been unbanned after their temporary ban expired.`)
-            .addFields({ name: 'Original Duration', value: humanDuration(durationMs) })
-            .setTimestamp();
-          await sendModLog(unbanLog);
-        } catch (err) { console.error('Unban failed:', err.message); }
-      }, durationMs);
+      scheduleBanExpiry(targetUser.id, targetUser.tag, interaction.guild.id, durationMs);
 
       // Log it
       await sendModLog(modLogEmbed('Member Banned', interaction.user, targetUser, { reason, duration: humanDuration(durationMs), color: 0xFF0000 }));
@@ -759,6 +836,7 @@ client.on('interactionCreate', async interaction => {
 
       // Remove the warning
       warnings[targetUser.id].splice(warnIndex, 1);
+      saveJSON(FILES.warnings, warnings);
       const remaining = warnings[targetUser.id].length;
 
       // DM the user
@@ -864,6 +942,8 @@ client.on('interactionCreate', async interaction => {
 
       try {
         await interaction.guild.members.unban(userId, `Unbanned by ${interaction.user.tag}: ${reason}`);
+      // Remove from persisted bans if present
+      if (savedBans[userId]) { delete savedBans[userId]; saveJSON(FILES.activeBans, savedBans); }
       } catch (err) {
         return interaction.editReply(`❌ Failed to unban: ${err.message}`);
       }
@@ -1009,6 +1089,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ content: '⚠️ You already have an active shift.', ephemeral: true });
       await member.roles.add(SHIFT_ROLE_ID).catch(() => {});
       shiftStartTimes[interaction.user.id] = Date.now();
+      saveJSON(FILES.shiftStartTimes, shiftStartTimes);
       return interaction.reply({ content: '✅ Your shift has started! Good luck!', ephemeral: true });
     }
 
@@ -1022,6 +1103,8 @@ client.on('interactionCreate', async interaction => {
         const elapsed = Math.floor((Date.now() - shiftStartTimes[interaction.user.id]) / 1000);
         weeklyActivity[interaction.user.id] = (weeklyActivity[interaction.user.id] || 0) + elapsed;
         delete shiftStartTimes[interaction.user.id];
+        saveJSON(FILES.weeklyActivity, weeklyActivity);
+        saveJSON(FILES.shiftStartTimes, shiftStartTimes);
       }
       return interaction.reply({ content: '✅ Your shift has ended. Thanks for your time!', ephemeral: true });
     }
