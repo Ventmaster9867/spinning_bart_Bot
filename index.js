@@ -274,7 +274,17 @@ client.once('ready', async () => {
       .addStringOption(o => o.setName('reason').setDescription('Reason for unmute').setRequired(false)).toJSON(),
     new SlashCommandBuilder().setName('unban').setDescription('Unban a user early [Perm 3 only]')
       .addStringOption(o => o.setName('userid').setDescription('User ID to unban').setRequired(true))
-      .addStringOption(o => o.setName('reason').setDescription('Reason for early unban').setRequired(false)).toJSON()
+      .addStringOption(o => o.setName('reason').setDescription('Reason for early unban').setRequired(false)).toJSON(),
+
+    new SlashCommandBuilder().setName('status').setDescription('Change the bot status [Owner only]')
+      .addStringOption(o => o.setName('text').setDescription('Status text').setRequired(true))
+      .addStringOption(o => o.setName('emoji').setDescription('Emoji to prefix the status').setRequired(false))
+      .addStringOption(o => o.setName('state').setDescription('Bot state').setRequired(false)
+        .addChoices(
+          { name: 'Online', value: 'online' },
+          { name: 'Idle', value: 'idle' },
+          { name: 'Do Not Disturb', value: 'dnd' }
+        )).toJSON()
   ];
 
   try {
@@ -701,6 +711,24 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply(`✅ **${targetUser.tag}** has been banned for **${humanDuration(durationMs)}**.\nThey were DM'd before the ban.`);
     }
 
+    // ===== STATUS =====
+    if (interaction.commandName === 'status') {
+      if (interaction.user.id !== MAINT_USER_ID) return interaction.editReply('❌ This command is owner only.');
+      const text = interaction.options.getString('text');
+      const emoji = interaction.options.getString('emoji') || '';
+      const state = interaction.options.getString('state') || 'idle';
+      const fullText = emoji ? `${emoji} ${text}` : text;
+      try {
+        await client.user.setPresence({
+          status: state,
+          activities: [{ name: fullText, type: ActivityType.Playing }]
+        });
+        return interaction.editReply(`✅ Status updated to **${fullText}** (${state})`);
+      } catch (err) {
+        return interaction.editReply(`❌ Failed to set status: ${err.message}`);
+      }
+    }
+
     // ===== UNWARN =====
     if (interaction.commandName === 'unwarn') {
       // To undo a Perm 1 warn you need Perm 2. To undo a Perm 2 warn you need Perm 3.
@@ -724,7 +752,9 @@ client.on('interactionCreate', async interaction => {
         warnIssuerPerm = getPermLevel(warnIssuerMember);
       } catch {}
 
-      if (warnIssuerPerm >= permLevel)
+      // Perm 3 can remove any warning (including ones issued by other Perm 3s)
+      // Lower perms still need to outrank the issuer
+      if (permLevel < 3 && warnIssuerPerm >= permLevel)
         return interaction.editReply(`❌ You need a higher permission level than the moderator who issued this warning (Perm ${warnIssuerPerm}) to remove it.`);
 
       // Remove the warning
