@@ -359,7 +359,10 @@ client.once('ready', async () => {
           { name: 'Online', value: 'online' },
           { name: 'Idle', value: 'idle' },
           { name: 'Do Not Disturb', value: 'dnd' }
-        )).toJSON()
+        )).toJSON(),
+
+    // Topic
+    new SlashCommandBuilder().setName('topic').setDescription('Request a topic change in the current channel [Perm 1+]').toJSON(),
   ];
 
   try {
@@ -406,7 +409,8 @@ client.on('interactionCreate', async interaction => {
         '• `/warn` — Warn a member *(Perm 1+)*\n' +
         '• `/view-warnings` — View a user\'s warnings *(Perm 1+)*\n' +
         '• `/my-warns` — View your own warnings\n' +
-        '• `/bloxy-ban` — Ban a user *(Perm 3)*\n\n' +
+        '• `/bloxy-ban` — Ban a user *(Perm 3)*\n' +
+        '• `/topic` — Request a topic change *(Perm 1+)*\n\n' +
         '↩️ **Undo Commands:**\n' +
         '• `/unwarn` — Remove a warning *(Perm 2 undoes Perm 1, Perm 3 undoes Perm 2)*\n' +
         '• `/unmute` — Remove a mute *(Perm 2 undoes Perm 1, Perm 3 undoes Perm 2)*\n' +
@@ -558,6 +562,21 @@ client.on('interactionCreate', async interaction => {
     // =========================================================
     // ==================== MODERATION ========================
     // =========================================================
+
+    // ===== TOPIC =====
+    if (interaction.commandName === 'topic') {
+      if (permLevel < 1) return interaction.editReply('❌ You need at least Permission Level 1 to use this command.');
+
+      const embed = new EmbedBuilder()
+        .setTitle('🔄 Topic Change')
+        .setColor(0xFF6600)
+        .setDescription('Please change the current topic of conversation.\nKeep all discussion relevant, respectful, and within the server rules.')
+        .addFields({ name: 'Requested by', value: `<@${interaction.user.id}>`, inline: true })
+        .setTimestamp();
+
+      await interaction.channel.send({ embeds: [embed] });
+      return interaction.editReply('✅ Topic change embed sent.');
+    }
 
     // ===== WARN =====
     if (interaction.commandName === 'warn') {
