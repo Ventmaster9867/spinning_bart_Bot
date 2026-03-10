@@ -55,7 +55,7 @@ const MAINT_USER_ID = '1166915839992270930';
 const SHIFT_ROLE_ID = '1475191266084917298';
 const NOTIFY_ROLE_ID = '1395209235389743114';
 const SCHEDULE_WHITELIST_ROLES = ['1410771734700888064', '1395231118537523220'];
-const SSU_REQUEST_ROLE_ID = '1481025393665249391'; // Can REQUEST an SSU — needs both WL approvals
+const SSU_REQUEST_ROLE_ID = '1481025393665249391'; // Can REQUEST an SSU — needs 1 WL approval
 
 // -------------------- PERMISSION LEVELS --------------------
 const PERM_ROLES = {
@@ -93,7 +93,7 @@ let pendingMuteRequests = {};
 let currentSession = null;
 
 // Pending SSU approval requests from SSU_REQUEST_ROLE members
-// { reqId: { userId, userTag, gameLink, schedId, approvals: Set, denials: Set, dmMessageIds: { wlUserId: msgId } } }
+// { reqId: { userId, userTag, gameLink, schedId, dmMessageIds: { wlUserId: msgId } } }
 let pendingSSURequests = {};
 
 let warnings        = loadJSON(FILES.warnings, {});
@@ -294,7 +294,6 @@ function scheduleWeeklyReport() {
 }
 
 // -------------------- SSU EXECUTION HELPER --------------------
-// Called once all approvals are received (or immediately for WL users)
 async function executeSSU(userId, userTag, gameLink, schedId) {
   const announceChannel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID).catch(() => null);
   if (!announceChannel) { console.error('executeSSU: Announcement channel missing.'); return; }
@@ -351,7 +350,7 @@ client.once('ready', async () => {
 
     // Session
     new SlashCommandBuilder().setName('maintenance').setDescription('Toggle maintenance mode').toJSON(),
-    new SlashCommandBuilder().setName('ssu').setDescription('Start a session (whitelisted instantly; approved role needs WL approval)')
+    new SlashCommandBuilder().setName('ssu').setDescription('Start a session (whitelisted instantly; approved role needs 1 WL approval)')
       .addStringOption(o => o.setName('game_link').setDescription('Roblox link (https://roblox.com...)').setRequired(true))
       .addStringOption(o => o.setName('schedule_id').setDescription('Linked schedule ID (optional)').setRequired(false)).toJSON(),
     new SlashCommandBuilder().setName('server-hop').setDescription('Start a server hop (whitelisted or current host only)')
@@ -395,6 +394,11 @@ client.once('ready', async () => {
           { name: 'Idle', value: 'idle' },
           { name: 'Do Not Disturb', value: 'dnd' }
         )).toJSON(),
+
+    // Owner DM
+    new SlashCommandBuilder().setName('dm').setDescription('DM a user as the bot [Owner only]')
+      .addUserOption(o => o.setName('user').setDescription('User to DM').setRequired(true))
+      .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true)).toJSON(),
   ];
 
   try {
@@ -434,12 +438,13 @@ client.on('interactionCreate', async interaction => {
         '• `/schedule` — Schedule a session *(whitelisted)*\n' +
         '• `/schedule-view` — View & sign up for sessions\n' +
         '• `/del-schedule` — Delete a session *(whitelisted)*\n' +
-        '• `/ssu` — Start a session *(whitelisted instantly; approved role needs both WL approvals)*\n' +
+        '• `/ssu` — Start a session *(whitelisted instantly; approved role needs 1 WL approval)*\n' +
         '• `/server-hop` — Server hop *(whitelisted or current host only)*\n' +
         '• `/ssd` — Shutdown session *(current host or whitelisted only)*\n' +
         '• `/host-transfer` — Transfer session host *(current host or whitelisted)*\n' +
         '• `/notify-active` — DM all active members *(Perm 2)*\n' +
-        '• `/maintenance` — Toggle maintenance *(owner)*\n\n' +
+        '• `/maintenance` — Toggle maintenance *(owner)*\n' +
+        '• `/dm` — DM a user as the bot *(owner)*\n\n' +
         '🛡️ **Moderation:**\n' +
         '• `/warn` — Warn a member *(Perm 1+)*\n' +
         '• `/view-warnings` — View a user\'s warnings *(Perm 1+)*\n' +
@@ -518,15 +523,14 @@ client.on('interactionCreate', async interaction => {
       if (!link.startsWith('https://roblox.com')) return interaction.editReply('❌ Link must start with `https://roblox.com`.');
       if (!announceChannel) return interaction.editReply('❌ Announcement channel missing.');
 
-      // Whitelisted users start immediately, no approval needed
+      // Whitelisted users start immediately
       if (isWhitelisted) {
         await executeSSU(interaction.user.id, interaction.user.tag, link, schedId);
         return interaction.editReply('✅ Session started!');
       }
 
-      // SSU request role — send approval DMs to both WL users
+      // SSU request role — send approval DM to all WL users, first to respond wins
       if (hasSSURequestRole) {
-        // Check there isn't already a pending request from this user
         const existing = Object.values(pendingSSURequests).find(r => r.userId === interaction.user.id);
         if (existing) return interaction.editReply('⚠️ You already have a pending SSU request. Please wait for it to be reviewed.');
 
@@ -536,15 +540,13 @@ client.on('interactionCreate', async interaction => {
           userTag: interaction.user.tag,
           gameLink: link,
           schedId: schedId || null,
-          approvals: new Set(),
-          denials: new Set(),
           dmMessageIds: {}
         };
 
         const dmEmbed = new EmbedBuilder()
           .setTitle('🔔 SSU Approval Request')
           .setColor(0x00AAFF)
-          .setDescription(`**${interaction.user.tag}** is requesting to start a session and needs your approval.\n\n⚠️ **Both whitelisted users must approve for the session to start. One denial will cancel it.**`)
+          .setDescription(`**${interaction.user.tag}** is requesting to start a session and needs approval.\n\n⚡ **First whitelisted user to approve will start the session.**`)
           .addFields(
             { name: 'Requested By', value: `${interaction.user.tag} (<@${interaction.user.id}>)` },
             { name: 'Game Link', value: link },
@@ -574,7 +576,7 @@ client.on('interactionCreate', async interaction => {
           return interaction.editReply('❌ Could not reach any whitelisted users. Please ask them to enable DMs.');
         }
 
-        return interaction.editReply(`⏳ SSU request sent to **${sentCount}** whitelisted user(s) for approval. Both must approve before the session starts. You will be notified of the outcome.`);
+        return interaction.editReply(`⏳ SSU request sent to **${sentCount}** whitelisted user(s). Only **one** approval is needed. You will be notified of the outcome.`);
       }
 
       return interaction.editReply('❌ You do not have permission to start a session.');
@@ -663,7 +665,7 @@ client.on('interactionCreate', async interaction => {
         await newHostUser.send({ embeds: [newHostEmbed] });
       } catch {}
 
-      // DM the old host (if not the one doing the transfer)
+      // DM the old host if they didn't initiate the transfer themselves
       if (oldHostId !== interaction.user.id) {
         try {
           const oldHostUser = await client.users.fetch(oldHostId);
@@ -718,6 +720,19 @@ client.on('interactionCreate', async interaction => {
         .setTimestamp();
       await interaction.channel.send({ embeds: [embed] });
       return interaction.editReply('✅ Topic change embed sent.');
+    }
+
+    // ===== DM =====
+    if (interaction.commandName === 'dm') {
+      if (interaction.user.id !== MAINT_USER_ID) return interaction.editReply('❌ This command is owner only.');
+      const targetUser = interaction.options.getUser('user');
+      const message = interaction.options.getString('message');
+      try {
+        await targetUser.send(message);
+        return interaction.editReply(`✅ Message sent to **${targetUser.tag}**.`);
+      } catch (err) {
+        return interaction.editReply(`❌ Failed to DM **${targetUser.tag}**. They may have DMs disabled.\n\`${err.message}\``);
+      }
     }
 
     // ===== WARN =====
@@ -1126,54 +1141,41 @@ client.on('interactionCreate', async interaction => {
       if (!req) return interaction.reply({ content: '❌ Request not found or already handled.', ephemeral: true });
       if (!WHITELIST_USERS.includes(interaction.user.id))
         return interaction.reply({ content: '❌ Only whitelisted users can approve SSU requests.', ephemeral: true });
-      if (req.approvals.has(interaction.user.id))
-        return interaction.reply({ content: '⚠️ You have already approved this request.', ephemeral: true });
 
-      req.approvals.add(interaction.user.id);
+      await interaction.reply({ content: '✅ SSU approved! Session is now starting.', ephemeral: true });
 
-      if (req.approvals.size >= WHITELIST_USERS.length) {
-        // All WL users approved — launch the session
-        await interaction.reply({ content: '✅ You approved the SSU. All approvals received — session is now starting!', ephemeral: true });
-
-        // Clean up DM buttons for all WL users
-        for (const [wlId, msgId] of Object.entries(req.dmMessageIds)) {
-          try {
-            const wlUser = await client.users.fetch(wlId);
-            const dmChannel = await wlUser.createDM();
-            const dmMsg = await dmChannel.messages.fetch(msgId);
-            await dmMsg.edit({ components: [] });
-          } catch {}
-        }
-
-        // Notify the requester
+      // Disable buttons on ALL WL DMs so the other WL user can't double-act
+      for (const [wlId, msgId] of Object.entries(req.dmMessageIds)) {
         try {
-          const approvedEmbed = new EmbedBuilder()
-            .setTitle('✅ SSU Request Approved')
-            .setColor(0x00FF00)
-            .setDescription('Your session start request has been approved by all whitelisted users! The session is now live.')
-            .setTimestamp();
-          const requester = await client.users.fetch(req.userId);
-          await requester.send({ embeds: [approvedEmbed] });
-        } catch {}
-
-        await executeSSU(req.userId, req.userTag, req.gameLink, req.schedId);
-        delete pendingSSURequests[reqId];
-
-      } else {
-        // Still waiting on more approvals
-        const remaining = WHITELIST_USERS.length - req.approvals.size;
-        await interaction.reply({ content: `✅ You approved the SSU request. Waiting for **${remaining}** more approval(s).`, ephemeral: true });
-
-        try {
-          const partialEmbed = new EmbedBuilder()
-            .setTitle('⏳ SSU Partially Approved')
-            .setColor(0xFFAA00)
-            .setDescription(`**${interaction.user.tag}** has approved your session request.\nWaiting for **${remaining}** more approval(s) before the session starts.`)
-            .setTimestamp();
-          const requester = await client.users.fetch(req.userId);
-          await requester.send({ embeds: [partialEmbed] });
+          const wlUser = await client.users.fetch(wlId);
+          const dmChannel = await wlUser.createDM();
+          const dmMsg = await dmChannel.messages.fetch(msgId);
+          await dmMsg.edit({ components: [] });
         } catch {}
       }
+
+      // Notify the other WL user that it was approved
+      for (const wlId of WHITELIST_USERS) {
+        if (wlId === interaction.user.id) continue;
+        try {
+          const otherWl = await client.users.fetch(wlId);
+          await otherWl.send({ content: `ℹ️ The SSU request from **${req.userTag}** was approved by **${interaction.user.tag}** and the session is now live.` });
+        } catch {}
+      }
+
+      // Notify the requester
+      try {
+        const approvedEmbed = new EmbedBuilder()
+          .setTitle('✅ SSU Request Approved')
+          .setColor(0x00FF00)
+          .setDescription(`Your session request was approved by **${interaction.user.tag}**! The session is now live.`)
+          .setTimestamp();
+        const requester = await client.users.fetch(req.userId);
+        await requester.send({ embeds: [approvedEmbed] });
+      } catch {}
+
+      await executeSSU(req.userId, req.userTag, req.gameLink, req.schedId);
+      delete pendingSSURequests[reqId];
     }
 
     // ===== SSU DENY =====
@@ -1186,7 +1188,7 @@ client.on('interactionCreate', async interaction => {
 
       await interaction.reply({ content: '✅ SSU request denied.', ephemeral: true });
 
-      // Clean up DM buttons for all WL users
+      // Disable buttons on all WL DMs
       for (const [wlId, msgId] of Object.entries(req.dmMessageIds)) {
         try {
           const wlUser = await client.users.fetch(wlId);
@@ -1207,7 +1209,7 @@ client.on('interactionCreate', async interaction => {
         await requester.send({ embeds: [deniedEmbed] });
       } catch {}
 
-      // Notify the other WL user so they know not to act on it
+      // Notify the other WL user
       for (const wlId of WHITELIST_USERS) {
         if (wlId === interaction.user.id) continue;
         try {
