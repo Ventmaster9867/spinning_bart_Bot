@@ -24,7 +24,8 @@ const FILES = {
   weeklyActivity:  path.join(DATA_DIR, 'weeklyActivity.json'),
   modLogs:         path.join(DATA_DIR, 'modLogs.json'),
   activeBans:      path.join(DATA_DIR, 'activeBans.json'),
-  shiftStartTimes: path.join(DATA_DIR, 'shiftStartTimes.json')
+  shiftStartTimes: path.join(DATA_DIR, 'shiftStartTimes.json'),
+  sessionActivity: path.join(DATA_DIR, 'sessionActivity.json')
 };
 
 function loadJSON(file, fallback) {
@@ -55,7 +56,11 @@ const MAINT_USER_ID = '1166915839992270930';
 const SHIFT_ROLE_ID = '1475191266084917298';
 const NOTIFY_ROLE_ID = '1395209235389743114';
 const SCHEDULE_WHITELIST_ROLES = ['1410771734700888064', '1395231118537523220'];
-const SSU_REQUEST_ROLE_ID = '1481025393665249391'; // Can REQUEST an SSU — needs 1 WL approval
+const SSU_REQUEST_ROLE_ID = '1481025393665249391';
+
+// Shift grinding threshold — how many seconds in a session counts as "grinding"
+// Default: 2 shifts of 30min+ within the same session flags them
+const GRIND_THRESHOLD_SECONDS = 3600; // 1 hour total in a single session
 
 // -------------------- PERMISSION LEVELS --------------------
 const PERM_ROLES = {
@@ -92,8 +97,11 @@ let pendingMuteRequests = {};
 // Tracks who is currently hosting — { hostId, hostTag, gameLink }
 let currentSession = null;
 
-// Pending SSU approval requests from SSU_REQUEST_ROLE members
-// { reqId: { userId, userTag, gameLink, schedId, dmMessageIds: { wlUserId: msgId } } }
+// Per-session shift activity tracking — resets each SSU
+// { userId: { tag, seconds } }
+let sessionActivity = {};
+
+// Pending SSU approval requests
 let pendingSSURequests = {};
 
 let warnings        = loadJSON(FILES.warnings, {});
@@ -128,7 +136,10 @@ async function setMaintenanceStatus() {
 function formatDuration(seconds) {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
-  return `${h}h ${m}m`;
+  const s = seconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 function buildSessionButtons(gameLink) {
@@ -173,6 +184,53 @@ function humanDuration(ms) {
   if (h) parts.push(`${h}h`);
   if (m) parts.push(`${m}m`);
   return parts.join(' ') || '0m';
+}
+
+// -------------------- SHIFT ACTIVITY REPORT --------------------
+// Called whenever a single shift ends (manual end-shift button)
+async function sendShiftActivityReport(endedUserId, endedUserTag, elapsedSeconds) {
+  // Build the full session leaderboard sorted by time desc
+  const entries = Object.entries(sessionActivity)
+    .sort((a, b) => b[1].seconds - a[1].seconds);
+
+  if (entries.length === 0) return;
+
+  // Flag grinders — anyone at or above the threshold
+  const grinders = entries.filter(([, v]) => v.seconds >= GRIND_THRESHOLD_SECONDS);
+
+  const leaderboard = entries.map(([uid, v], i) => {
+    const flag = v.seconds >= GRIND_THRESHOLD_SECONDS ? ' 🚨' : '';
+    return `**${i + 1}.** <@${uid}> (${v.tag}) — ${formatDuration(v.seconds)}${flag}`;
+  }).join('\n');
+
+  const grindWarning = grinders.length > 0
+    ? `\n\n⚠️ **Possible Shift Grinders (${GRIND_THRESHOLD_SECONDS / 60}+ min this session):**\n` +
+      grinders.map(([uid, v]) => `• <@${uid}> (${v.tag}) — ${formatDuration(v.seconds)}`).join('\n')
+    : '';
+
+  const embed = new EmbedBuilder()
+    .setTitle('📊 Session Activity Report')
+    .setColor(grinders.length > 0 ? 0xFF6600 : 0x00AAFF)
+    .setDescription(
+      `**Shift ended by:** ${endedUserTag} (<@${endedUserId}>) — Time: **${formatDuration(elapsedSeconds)}**\n\n` +
+      `**All shifts this session (sorted by time):**\n${leaderboard}` +
+      grindWarning
+    )
+    .setFooter({ text: `🚨 = ${GRIND_THRESHOLD_SECONDS / 60}+ minutes in this session` })
+    .setTimestamp();
+
+  // Recipients: both WL users + current host (deduplicated)
+  const recipientIds = new Set([...WHITELIST_USERS]);
+  if (currentSession) recipientIds.add(currentSession.hostId);
+
+  for (const uid of recipientIds) {
+    try {
+      const user = await client.users.fetch(uid);
+      await user.send({ embeds: [embed] });
+    } catch (err) {
+      console.error(`Failed to DM activity report to ${uid}:`, err.message);
+    }
+  }
 }
 
 // -------------------- MOD LOGGING --------------------
@@ -322,6 +380,9 @@ async function executeSSU(userId, userTag, gameLink, schedId) {
   activeSessionMessageId = msg.id;
   activeSessionChannelId = announceChannel.id;
   currentSession = { hostId: userId, hostTag: userTag, gameLink };
+
+  // Reset session activity tracking for the new session
+  sessionActivity = {};
 }
 
 // -------------------- READY --------------------
@@ -523,13 +584,11 @@ client.on('interactionCreate', async interaction => {
       if (!link.startsWith('https://roblox.com')) return interaction.editReply('❌ Link must start with `https://roblox.com`.');
       if (!announceChannel) return interaction.editReply('❌ Announcement channel missing.');
 
-      // Whitelisted users start immediately
       if (isWhitelisted) {
         await executeSSU(interaction.user.id, interaction.user.tag, link, schedId);
         return interaction.editReply('✅ Session started!');
       }
 
-      // SSU request role — send approval DM to all WL users, first to respond wins
       if (hasSSURequestRole) {
         const existing = Object.values(pendingSSURequests).find(r => r.userId === interaction.user.id);
         if (existing) return interaction.editReply('⚠️ You already have a pending SSU request. Please wait for it to be reviewed.');
@@ -613,6 +672,9 @@ client.on('interactionCreate', async interaction => {
         if (shiftStartTimes[uid]) {
           const elapsed = Math.floor((Date.now() - shiftStartTimes[uid]) / 1000);
           weeklyActivity[uid] = (weeklyActivity[uid] || 0) + elapsed;
+          // Also accumulate into session activity
+          if (!sessionActivity[uid]) sessionActivity[uid] = { tag: m.user.tag, seconds: 0 };
+          sessionActivity[uid].seconds += elapsed;
           delete shiftStartTimes[uid];
         }
       }
@@ -633,6 +695,7 @@ client.on('interactionCreate', async interaction => {
       }
 
       currentSession = null;
+      sessionActivity = {};
 
       if (announceChannel) await announceChannel.send({ embeds: [new EmbedBuilder().setTitle('🔴 Session Shutdown').setColor(0xFF0000).setDescription('The session has been shutdown.')] });
       return interaction.editReply(`✅ Session shut down. Removed shift role from ${membersWithRole.size} member(s).`);
@@ -655,7 +718,6 @@ client.on('interactionCreate', async interaction => {
       currentSession.hostId = newHostUser.id;
       currentSession.hostTag = newHostUser.tag;
 
-      // DM the new host
       try {
         const newHostEmbed = new EmbedBuilder()
           .setTitle('🎙️ You Are Now the Session Host')
@@ -665,7 +727,6 @@ client.on('interactionCreate', async interaction => {
         await newHostUser.send({ embeds: [newHostEmbed] });
       } catch {}
 
-      // DM the old host if they didn't initiate the transfer themselves
       if (oldHostId !== interaction.user.id) {
         try {
           const oldHostUser = await client.users.fetch(oldHostId);
@@ -678,7 +739,6 @@ client.on('interactionCreate', async interaction => {
         } catch {}
       }
 
-      // Announce in the session channel
       if (announceChannel) {
         const announceEmbed = new EmbedBuilder()
           .setTitle('🔁 Host Transfer')
@@ -1144,7 +1204,7 @@ client.on('interactionCreate', async interaction => {
 
       await interaction.reply({ content: '✅ SSU approved! Session is now starting.', ephemeral: true });
 
-      // Disable buttons on ALL WL DMs so the other WL user can't double-act
+      // Disable buttons on all WL DMs
       for (const [wlId, msgId] of Object.entries(req.dmMessageIds)) {
         try {
           const wlUser = await client.users.fetch(wlId);
@@ -1154,7 +1214,7 @@ client.on('interactionCreate', async interaction => {
         } catch {}
       }
 
-      // Notify the other WL user that it was approved
+      // Notify the other WL user
       for (const wlId of WHITELIST_USERS) {
         if (wlId === interaction.user.id) continue;
         try {
@@ -1188,7 +1248,6 @@ client.on('interactionCreate', async interaction => {
 
       await interaction.reply({ content: '✅ SSU request denied.', ephemeral: true });
 
-      // Disable buttons on all WL DMs
       for (const [wlId, msgId] of Object.entries(req.dmMessageIds)) {
         try {
           const wlUser = await client.users.fetch(wlId);
@@ -1198,7 +1257,6 @@ client.on('interactionCreate', async interaction => {
         } catch {}
       }
 
-      // Notify the requester
       try {
         const deniedEmbed = new EmbedBuilder()
           .setTitle('❌ SSU Request Denied')
@@ -1209,7 +1267,6 @@ client.on('interactionCreate', async interaction => {
         await requester.send({ embeds: [deniedEmbed] });
       } catch {}
 
-      // Notify the other WL user
       for (const wlId of WHITELIST_USERS) {
         if (wlId === interaction.user.id) continue;
         try {
@@ -1314,15 +1371,33 @@ client.on('interactionCreate', async interaction => {
       if (!member) return interaction.reply({ content: '❌ Could not find your member profile.', ephemeral: true });
       if (!member.roles.cache.has(SHIFT_ROLE_ID))
         return interaction.reply({ content: '⚠️ You do not have an active shift.', ephemeral: true });
+
       await member.roles.remove(SHIFT_ROLE_ID).catch(() => {});
+
+      let elapsed = 0;
       if (shiftStartTimes[interaction.user.id]) {
-        const elapsed = Math.floor((Date.now() - shiftStartTimes[interaction.user.id]) / 1000);
+        elapsed = Math.floor((Date.now() - shiftStartTimes[interaction.user.id]) / 1000);
+
+        // Accumulate into weekly activity
         weeklyActivity[interaction.user.id] = (weeklyActivity[interaction.user.id] || 0) + elapsed;
+
+        // Accumulate into session activity for the grind report
+        if (!sessionActivity[interaction.user.id]) {
+          sessionActivity[interaction.user.id] = { tag: interaction.user.tag, seconds: 0 };
+        }
+        sessionActivity[interaction.user.id].seconds += elapsed;
+
         delete shiftStartTimes[interaction.user.id];
         saveJSON(FILES.weeklyActivity, weeklyActivity);
         saveJSON(FILES.shiftStartTimes, shiftStartTimes);
       }
-      return interaction.reply({ content: '✅ Your shift has ended. Thanks for your time!', ephemeral: true });
+
+      await interaction.reply({ content: `✅ Your shift has ended. You worked for **${formatDuration(elapsed)}**. Thanks for your time!`, ephemeral: true });
+
+      // Fire the activity report DM to host + WL users (non-blocking)
+      sendShiftActivityReport(interaction.user.id, interaction.user.tag, elapsed).catch(err => {
+        console.error('Failed to send shift activity report:', err.message);
+      });
     }
 
   } catch (err) {
