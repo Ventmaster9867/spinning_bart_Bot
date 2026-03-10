@@ -20,10 +20,10 @@ const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const FILES = {
-  warnings:      path.join(DATA_DIR, 'warnings.json'),
-  weeklyActivity: path.join(DATA_DIR, 'weeklyActivity.json'),
-  modLogs:       path.join(DATA_DIR, 'modLogs.json'),
-  activeBans:    path.join(DATA_DIR, 'activeBans.json'),
+  warnings:        path.join(DATA_DIR, 'warnings.json'),
+  weeklyActivity:  path.join(DATA_DIR, 'weeklyActivity.json'),
+  modLogs:         path.join(DATA_DIR, 'modLogs.json'),
+  activeBans:      path.join(DATA_DIR, 'activeBans.json'),
   shiftStartTimes: path.join(DATA_DIR, 'shiftStartTimes.json')
 };
 
@@ -40,7 +40,6 @@ function saveJSON(file, data) {
   } catch (err) { console.error(`Failed to save ${file}:`, err.message); }
 }
 
-// Append a single mod log entry to the log file immediately (hard save)
 function appendModLog(entry) {
   const logs = loadJSON(FILES.modLogs, []);
   logs.push(entry);
@@ -56,9 +55,9 @@ const MAINT_USER_ID = '1166915839992270930';
 const SHIFT_ROLE_ID = '1475191266084917298';
 const NOTIFY_ROLE_ID = '1395209235389743114';
 const SCHEDULE_WHITELIST_ROLES = ['1410771734700888064', '1395231118537523220'];
+const SSU_REQUEST_ROLE_ID = '1481025393665249391'; // Can REQUEST an SSU — needs both WL approvals
 
 // -------------------- PERMISSION LEVELS --------------------
-// Higher = more powerful
 const PERM_ROLES = {
   3: ['1410771734700888064', '1395231118537523220'],
   2: ['1395209235389743114'],
@@ -83,18 +82,24 @@ const client = new Client({
 });
 
 // -------------------- DATA --------------------
-let schedules = [];        // not persisted — session-specific
+let schedules = [];
 let botReady = false;
 let maintenanceMode = false;
 let activeSessionMessageId = null;
 let activeSessionChannelId = ANNOUNCE_CHANNEL_ID;
-let pendingMuteRequests = {}; // in-memory only
+let pendingMuteRequests = {};
 
-// Persisted data — loaded from disk on startup
-let warnings       = loadJSON(FILES.warnings, {});
-let weeklyActivity = loadJSON(FILES.weeklyActivity, {});
+// Tracks who is currently hosting — { hostId, hostTag, gameLink }
+let currentSession = null;
+
+// Pending SSU approval requests from SSU_REQUEST_ROLE members
+// { reqId: { userId, userTag, gameLink, schedId, approvals: Set, denials: Set, dmMessageIds: { wlUserId: msgId } } }
+let pendingSSURequests = {};
+
+let warnings        = loadJSON(FILES.warnings, {});
+let weeklyActivity  = loadJSON(FILES.weeklyActivity, {});
 let shiftStartTimes = loadJSON(FILES.shiftStartTimes, {});
-let savedBans      = loadJSON(FILES.activeBans, {}); // { userId: { expiresAt } }
+let savedBans       = loadJSON(FILES.activeBans, {});
 
 // -------------------- STATUS --------------------
 async function setNormalStatus() {
@@ -148,7 +153,6 @@ function formatTimestamp(utcMs) {
   return `<t:${s}:F> (<t:${s}:R>)`;
 }
 
-// Parse time strings like "10m", "2h", "3d", "1w"
 function parseDuration(str) {
   const match = str.match(/^(\d+)(m|h|d|w)$/i);
   if (!match) return null;
@@ -173,18 +177,17 @@ function humanDuration(ms) {
 
 // -------------------- MOD LOGGING --------------------
 async function sendModLog(embed) {
-  // Hard save to disk immediately
   const fields = (embed.data && embed.data.fields) ? embed.data.fields : [];
   appendModLog({
     timestamp: Date.now(),
-    title: (embed.data && embed.data.title) ? embed.data.title : "Mod Action",
+    title: (embed.data && embed.data.title) ? embed.data.title : 'Mod Action',
     fields: fields.map(f => ({ name: f.name, value: f.value }))
   });
   try {
     const ch = await client.channels.fetch(MOD_LOG_CHANNEL_ID);
     await ch.send({ embeds: [embed] });
   } catch (err) {
-    console.error("Failed to send mod log:", err.message);
+    console.error('Failed to send mod log:', err.message);
   }
 }
 
@@ -193,20 +196,19 @@ function modLogEmbed(action, moderator, target, extra = {}) {
     .setColor(extra.color || 0xFF6600)
     .setTitle(`🛡️ ${action}`)
     .addFields(
-      { name: "Moderator", value: `${moderator.tag} (<@${moderator.id}>)`, inline: true },
-      { name: "Target", value: `${target.tag} (<@${target.id}>)`, inline: true }
+      { name: 'Moderator', value: `${moderator.tag} (<@${moderator.id}>)`, inline: true },
+      { name: 'Target', value: `${target.tag} (<@${target.id}>)`, inline: true }
     )
     .setTimestamp();
-  if (extra.reason) embed.addFields({ name: "Reason", value: extra.reason });
-  if (extra.duration) embed.addFields({ name: "Duration", value: extra.duration, inline: true });
-  if (extra.warnCount !== undefined) embed.addFields({ name: "Total Warnings", value: String(extra.warnCount), inline: true });
+  if (extra.reason) embed.addFields({ name: 'Reason', value: extra.reason });
+  if (extra.duration) embed.addFields({ name: 'Duration', value: extra.duration, inline: true });
+  if (extra.warnCount !== undefined) embed.addFields({ name: 'Total Warnings', value: String(extra.warnCount), inline: true });
   return embed;
 }
 
 // -------------------- BAN PERSISTENCE --------------------
 function scheduleBanExpiry(userId, userTag, guildId, ms) {
-  // Cap setTimeout at ~24 days (JS max safe). For longer bans, re-schedule on restart.
-  const MAX_TIMEOUT = 2073600000; // 24 days in ms
+  const MAX_TIMEOUT = 2073600000;
   const delay = Math.min(ms, MAX_TIMEOUT);
   setTimeout(async () => {
     try {
@@ -225,16 +227,14 @@ function scheduleBanExpiry(userId, userTag, guildId, ms) {
   }, delay);
 }
 
-// Called on bot ready — re-schedule any bans that were active before shutdown
 function restorePendingBans() {
   const now = Date.now();
   for (const [userId, banData] of Object.entries(savedBans)) {
     const remaining = banData.expiresAt - now;
     if (remaining <= 0) {
-      // Already expired while bot was offline — unban immediately
       scheduleBanExpiry(userId, banData.tag, banData.guildId, 0);
     } else {
-      console.log(`Restoring ban for ${banData.tag}, expires in ${Math.round(remaining/60000)}m`);
+      console.log(`Restoring ban for ${banData.tag}, expires in ${Math.round(remaining / 60000)}m`);
       scheduleBanExpiry(userId, banData.tag, banData.guildId, remaining);
     }
   }
@@ -293,6 +293,38 @@ function scheduleWeeklyReport() {
   }, 60 * 1000);
 }
 
+// -------------------- SSU EXECUTION HELPER --------------------
+// Called once all approvals are received (or immediately for WL users)
+async function executeSSU(userId, userTag, gameLink, schedId) {
+  const announceChannel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID).catch(() => null);
+  if (!announceChannel) { console.error('executeSSU: Announcement channel missing.'); return; }
+
+  let signupPing = '';
+  if (schedId) {
+    const si = schedules.findIndex(s => s.id === schedId);
+    if (si !== -1) {
+      const s = schedules[si];
+      if (s.signups.size > 0) signupPing = [...s.signups].map(id => `<@${id}>`).join(' ');
+      if (s.embedMessageId) {
+        try { const m = await announceChannel.messages.fetch(s.embedMessageId); await m.delete(); } catch {}
+      }
+      schedules.splice(si, 1);
+    }
+  }
+
+  const embed = new EmbedBuilder().setTitle('🟢 Session Start Up!').setColor(0x00FF00)
+    .setDescription(`A session has been started by ${userTag}!\nPlease join using the link below!`);
+  const msg = await announceChannel.send({
+    content: `@everyone${signupPing ? '\n' + signupPing : ''}`,
+    embeds: [embed],
+    components: [buildSessionButtons(gameLink)]
+  });
+
+  activeSessionMessageId = msg.id;
+  activeSessionChannelId = announceChannel.id;
+  currentSession = { hostId: userId, hostTag: userTag, gameLink };
+}
+
 // -------------------- READY --------------------
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -319,12 +351,14 @@ client.once('ready', async () => {
 
     // Session
     new SlashCommandBuilder().setName('maintenance').setDescription('Toggle maintenance mode').toJSON(),
-    new SlashCommandBuilder().setName('ssu').setDescription('Start a session (whitelisted)')
+    new SlashCommandBuilder().setName('ssu').setDescription('Start a session (whitelisted instantly; approved role needs WL approval)')
       .addStringOption(o => o.setName('game_link').setDescription('Roblox link (https://roblox.com...)').setRequired(true))
       .addStringOption(o => o.setName('schedule_id').setDescription('Linked schedule ID (optional)').setRequired(false)).toJSON(),
-    new SlashCommandBuilder().setName('server-hop').setDescription('Start a server hop (whitelisted)')
+    new SlashCommandBuilder().setName('server-hop').setDescription('Start a server hop (whitelisted or current host only)')
       .addStringOption(o => o.setName('game_link').setDescription('Roblox link (https://roblox.com...)').setRequired(true)).toJSON(),
-    new SlashCommandBuilder().setName('ssd').setDescription('Shutdown the current session (whitelisted)').toJSON(),
+    new SlashCommandBuilder().setName('ssd').setDescription('Shutdown the current session (current host or whitelisted only)').toJSON(),
+    new SlashCommandBuilder().setName('host-transfer').setDescription('Transfer session host to another user (current host or whitelisted)')
+      .addUserOption(o => o.setName('user').setDescription('User to transfer host to').setRequired(true)).toJSON(),
     new SlashCommandBuilder().setName('notify-active').setDescription('DM all in-game of critical events')
       .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true)).toJSON(),
 
@@ -339,6 +373,7 @@ client.once('ready', async () => {
       .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
       .addStringOption(o => o.setName('duration').setDescription('Duration e.g. 10m, 2h, 3d, 1w').setRequired(true))
       .addStringOption(o => o.setName('reason').setDescription('Reason for ban').setRequired(true)).toJSON(),
+    new SlashCommandBuilder().setName('topic').setDescription('Request a topic change in the current channel [Perm 1+]').toJSON(),
 
     // Undo commands
     new SlashCommandBuilder().setName('unwarn').setDescription('Remove a warning from a user [Perm 2 to undo Perm 1 warns, Perm 3 for Perm 2]')
@@ -360,9 +395,6 @@ client.once('ready', async () => {
           { name: 'Idle', value: 'idle' },
           { name: 'Do Not Disturb', value: 'dnd' }
         )).toJSON(),
-
-    // Topic
-    new SlashCommandBuilder().setName('topic').setDescription('Request a topic change in the current channel [Perm 1+]').toJSON(),
   ];
 
   try {
@@ -388,6 +420,8 @@ client.on('interactionCreate', async interaction => {
     const isWhitelisted = WHITELIST_USERS.includes(interaction.user.id);
     const hasScheduleRole = SCHEDULE_WHITELIST_ROLES.some(r => member.roles.cache.has(r));
     const hasNotifyRole = member.roles.cache.has(NOTIFY_ROLE_ID);
+    const hasSSURequestRole = member.roles.cache.has(SSU_REQUEST_ROLE_ID);
+    const isCurrentHost = currentSession && currentSession.hostId === interaction.user.id;
 
     await interaction.deferReply({ ephemeral: true });
     const announceChannel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID).catch(() => null);
@@ -400,9 +434,10 @@ client.on('interactionCreate', async interaction => {
         '• `/schedule` — Schedule a session *(whitelisted)*\n' +
         '• `/schedule-view` — View & sign up for sessions\n' +
         '• `/del-schedule` — Delete a session *(whitelisted)*\n' +
-        '• `/ssu` — Start a session *(whitelisted)*\n' +
-        '• `/server-hop` — Server hop *(whitelisted)*\n' +
-        '• `/ssd` — Shutdown session *(whitelisted)*\n' +
+        '• `/ssu` — Start a session *(whitelisted instantly; approved role needs both WL approvals)*\n' +
+        '• `/server-hop` — Server hop *(whitelisted or current host only)*\n' +
+        '• `/ssd` — Shutdown session *(current host or whitelisted only)*\n' +
+        '• `/host-transfer` — Transfer session host *(current host or whitelisted)*\n' +
         '• `/notify-active` — DM all active members *(Perm 2)*\n' +
         '• `/maintenance` — Toggle maintenance *(owner)*\n\n' +
         '🛡️ **Moderation:**\n' +
@@ -477,46 +512,97 @@ client.on('interactionCreate', async interaction => {
 
     // ===== SSU =====
     if (interaction.commandName === 'ssu') {
-      if (!isWhitelisted) return interaction.editReply('❌ No permission.');
-      if (!announceChannel) return interaction.editReply('❌ Announcement channel missing.');
       const link = interaction.options.getString('game_link');
       const schedId = interaction.options.getString('schedule_id');
+
       if (!link.startsWith('https://roblox.com')) return interaction.editReply('❌ Link must start with `https://roblox.com`.');
-      let signupPing = '';
-      if (schedId) {
-        const si = schedules.findIndex(s => s.id === schedId);
-        if (si !== -1) {
-          const s = schedules[si];
-          if (s.signups.size > 0) signupPing = [...s.signups].map(id => `<@${id}>`).join(' ');
-          if (s.embedMessageId) { try { const m = await announceChannel.messages.fetch(s.embedMessageId); await m.delete(); } catch {} }
-          schedules.splice(si, 1);
-        }
+      if (!announceChannel) return interaction.editReply('❌ Announcement channel missing.');
+
+      // Whitelisted users start immediately, no approval needed
+      if (isWhitelisted) {
+        await executeSSU(interaction.user.id, interaction.user.tag, link, schedId);
+        return interaction.editReply('✅ Session started!');
       }
-      const embed = new EmbedBuilder().setTitle('🟢 Session Start Up!').setColor(0x00FF00)
-        .setDescription(`A session has been started by ${interaction.user.tag}!\nPlease join using the link below!`);
-      const msg = await announceChannel.send({ content: `@everyone${signupPing ? '\n' + signupPing : ''}`, embeds: [embed], components: [buildSessionButtons(link)] });
-      activeSessionMessageId = msg.id;
-      activeSessionChannelId = announceChannel.id;
-      return interaction.editReply('✅ Session started!');
+
+      // SSU request role — send approval DMs to both WL users
+      if (hasSSURequestRole) {
+        // Check there isn't already a pending request from this user
+        const existing = Object.values(pendingSSURequests).find(r => r.userId === interaction.user.id);
+        if (existing) return interaction.editReply('⚠️ You already have a pending SSU request. Please wait for it to be reviewed.');
+
+        const reqId = `ssuReq-${Date.now()}`;
+        pendingSSURequests[reqId] = {
+          userId: interaction.user.id,
+          userTag: interaction.user.tag,
+          gameLink: link,
+          schedId: schedId || null,
+          approvals: new Set(),
+          denials: new Set(),
+          dmMessageIds: {}
+        };
+
+        const dmEmbed = new EmbedBuilder()
+          .setTitle('🔔 SSU Approval Request')
+          .setColor(0x00AAFF)
+          .setDescription(`**${interaction.user.tag}** is requesting to start a session and needs your approval.\n\n⚠️ **Both whitelisted users must approve for the session to start. One denial will cancel it.**`)
+          .addFields(
+            { name: 'Requested By', value: `${interaction.user.tag} (<@${interaction.user.id}>)` },
+            { name: 'Game Link', value: link },
+            { name: 'Schedule ID', value: schedId || 'None' },
+            { name: 'Request ID', value: reqId }
+          )
+          .setTimestamp();
+
+        const approveBtn = new ButtonBuilder().setCustomId(`ssuApprove-${reqId}`).setLabel('✅ Approve').setStyle(ButtonStyle.Success);
+        const denyBtn = new ButtonBuilder().setCustomId(`ssuDeny-${reqId}`).setLabel('❌ Deny').setStyle(ButtonStyle.Danger);
+        const row = new ActionRowBuilder().addComponents(approveBtn, denyBtn);
+
+        let sentCount = 0;
+        for (const wlId of WHITELIST_USERS) {
+          try {
+            const wlUser = await client.users.fetch(wlId);
+            const dmMsg = await wlUser.send({ embeds: [dmEmbed], components: [row] });
+            pendingSSURequests[reqId].dmMessageIds[wlId] = dmMsg.id;
+            sentCount++;
+          } catch (err) {
+            console.error(`Failed to DM WL user ${wlId}:`, err.message);
+          }
+        }
+
+        if (sentCount === 0) {
+          delete pendingSSURequests[reqId];
+          return interaction.editReply('❌ Could not reach any whitelisted users. Please ask them to enable DMs.');
+        }
+
+        return interaction.editReply(`⏳ SSU request sent to **${sentCount}** whitelisted user(s) for approval. Both must approve before the session starts. You will be notified of the outcome.`);
+      }
+
+      return interaction.editReply('❌ You do not have permission to start a session.');
     }
 
     // ===== SERVER HOP =====
     if (interaction.commandName === 'server-hop') {
-      if (!isWhitelisted) return interaction.editReply('❌ No permission.');
+      if (!isWhitelisted && !isCurrentHost)
+        return interaction.editReply('❌ Only whitelisted users or the current session host can start a server hop.');
       if (!announceChannel) return interaction.editReply('❌ Announcement channel missing.');
+
       const link = interaction.options.getString('game_link');
       if (!link.startsWith('https://roblox.com')) return interaction.editReply('❌ Link must start with `https://roblox.com`.');
+
       const embed = new EmbedBuilder().setTitle('🔄 Server Hopping!').setColor(0xFFAA00)
         .setDescription('A server hop was started! Please join the new server below.');
       const msg = await announceChannel.send({ content: `@here <@&${SHIFT_ROLE_ID}>`, embeds: [embed], components: [buildSessionButtons(link)] });
       activeSessionMessageId = msg.id;
       activeSessionChannelId = announceChannel.id;
+      if (currentSession) currentSession.gameLink = link;
       return interaction.editReply('✅ Server hop posted!');
     }
 
     // ===== SSD =====
     if (interaction.commandName === 'ssd') {
-      if (!isWhitelisted) return interaction.editReply('❌ No permission.');
+      if (!isWhitelisted && !isCurrentHost)
+        return interaction.editReply('❌ Only the current session host or whitelisted users can shut down the session.');
+
       await interaction.guild.members.fetch();
       const membersWithRole = interaction.guild.members.cache.filter(m => m.roles.cache.has(SHIFT_ROLE_ID));
       for (const [uid, m] of membersWithRole) {
@@ -530,6 +616,7 @@ client.on('interactionCreate', async interaction => {
       }
       saveJSON(FILES.weeklyActivity, weeklyActivity);
       saveJSON(FILES.shiftStartTimes, shiftStartTimes);
+
       if (activeSessionMessageId) {
         try {
           const sc = await client.channels.fetch(activeSessionChannelId);
@@ -542,8 +629,65 @@ client.on('interactionCreate', async interaction => {
         } catch {}
         activeSessionMessageId = null;
       }
+
+      currentSession = null;
+
       if (announceChannel) await announceChannel.send({ embeds: [new EmbedBuilder().setTitle('🔴 Session Shutdown').setColor(0xFF0000).setDescription('The session has been shutdown.')] });
       return interaction.editReply(`✅ Session shut down. Removed shift role from ${membersWithRole.size} member(s).`);
+    }
+
+    // ===== HOST TRANSFER =====
+    if (interaction.commandName === 'host-transfer') {
+      if (!isWhitelisted && !isCurrentHost)
+        return interaction.editReply('❌ Only the current session host or whitelisted users can transfer the host.');
+      if (!currentSession)
+        return interaction.editReply('❌ There is no active session to transfer.');
+
+      const newHostUser = interaction.options.getUser('user');
+      const newHostMember = await interaction.guild.members.fetch(newHostUser.id).catch(() => null);
+      if (!newHostMember) return interaction.editReply('❌ User not found in this server.');
+      if (newHostUser.id === currentSession.hostId) return interaction.editReply('⚠️ That user is already the host.');
+
+      const oldHostTag = currentSession.hostTag;
+      const oldHostId = currentSession.hostId;
+      currentSession.hostId = newHostUser.id;
+      currentSession.hostTag = newHostUser.tag;
+
+      // DM the new host
+      try {
+        const newHostEmbed = new EmbedBuilder()
+          .setTitle('🎙️ You Are Now the Session Host')
+          .setColor(0x00AAFF)
+          .setDescription(`Session host has been transferred to you by **${interaction.user.tag}**.\nYou now have control of \`/server-hop\`, \`/ssd\`, and \`/host-transfer\`.`)
+          .setTimestamp();
+        await newHostUser.send({ embeds: [newHostEmbed] });
+      } catch {}
+
+      // DM the old host (if not the one doing the transfer)
+      if (oldHostId !== interaction.user.id) {
+        try {
+          const oldHostUser = await client.users.fetch(oldHostId);
+          const oldHostEmbed = new EmbedBuilder()
+            .setTitle('🔁 Host Transferred Away')
+            .setColor(0xFFAA00)
+            .setDescription(`Your host status has been transferred to **${newHostUser.tag}** by **${interaction.user.tag}**.`)
+            .setTimestamp();
+          await oldHostUser.send({ embeds: [oldHostEmbed] });
+        } catch {}
+      }
+
+      // Announce in the session channel
+      if (announceChannel) {
+        const announceEmbed = new EmbedBuilder()
+          .setTitle('🔁 Host Transfer')
+          .setColor(0x00AAFF)
+          .setDescription(`Session host has been transferred from **${oldHostTag}** to **${newHostUser.tag}**.`)
+          .addFields({ name: 'Transferred by', value: interaction.user.tag, inline: true })
+          .setTimestamp();
+        await announceChannel.send({ embeds: [announceEmbed] });
+      }
+
+      return interaction.editReply(`✅ Host transferred from **${oldHostTag}** to **${newHostUser.tag}**.`);
     }
 
     // ===== NOTIFY ACTIVE =====
@@ -566,14 +710,12 @@ client.on('interactionCreate', async interaction => {
     // ===== TOPIC =====
     if (interaction.commandName === 'topic') {
       if (permLevel < 1) return interaction.editReply('❌ You need at least Permission Level 1 to use this command.');
-
       const embed = new EmbedBuilder()
         .setTitle('🔄 Topic Change')
         .setColor(0xFF6600)
         .setDescription('Please change the current topic of conversation.\nKeep all discussion relevant, respectful, and within the server rules.')
         .addFields({ name: 'Requested by', value: `<@${interaction.user.id}>`, inline: true })
         .setTimestamp();
-
       await interaction.channel.send({ embeds: [embed] });
       return interaction.editReply('✅ Topic change embed sent.');
     }
@@ -590,7 +732,6 @@ client.on('interactionCreate', async interaction => {
       const targetPerm = getPermLevel(targetMember);
       if (targetPerm >= permLevel) return interaction.editReply('❌ You cannot warn someone with an equal or higher permission level.');
 
-      // Add warning
       if (!warnings[targetUser.id]) warnings[targetUser.id] = [];
       warnings[targetUser.id].push({
         reason,
@@ -601,7 +742,6 @@ client.on('interactionCreate', async interaction => {
       saveJSON(FILES.warnings, warnings);
       const warnCount = warnings[targetUser.id].length;
 
-      // DM the warned user
       try {
         const warnEmbed = new EmbedBuilder()
           .setTitle('⚠️ You Have Been Warned')
@@ -616,12 +756,9 @@ client.on('interactionCreate', async interaction => {
         await targetUser.send({ embeds: [warnEmbed] });
       } catch {}
 
-      // Log it
       await sendModLog(modLogEmbed('Warning Issued', interaction.user, targetUser, { reason, warnCount, color: 0xFFFF00 }));
 
-      // Auto action at 3 warnings
       if (warnCount >= 3) {
-        // Always apply 5 minute mute immediately
         try {
           await targetMember.timeout(5 * 60 * 1000, `Auto-mute: 3 warnings reached`);
         } catch (err) { console.error('Auto-mute failed:', err.message); }
@@ -635,7 +772,6 @@ client.on('interactionCreate', async interaction => {
         await sendModLog(autoMuteLog);
 
         if (permLevel >= 2) {
-          // Perm 2+ issued the 3rd warn — ask them directly if additional mute should be applied
           const reqId = `muteReq-${Date.now()}`;
           pendingMuteRequests[reqId] = {
             targetId: targetUser.id,
@@ -659,11 +795,9 @@ client.on('interactionCreate', async interaction => {
           const yesBtn = new ButtonBuilder().setCustomId(`muteApprove-${reqId}`).setLabel('Yes, Mute More').setStyle(ButtonStyle.Danger);
           const noBtn = new ButtonBuilder().setCustomId(`muteDeny-${reqId}`).setLabel('No, 5min is Enough').setStyle(ButtonStyle.Secondary);
           const row = new ActionRowBuilder().addComponents(yesBtn, noBtn);
-
           try { await interaction.user.send({ embeds: [dmEmbed], components: [row] }); } catch {}
 
         } else {
-          // Perm 1 issued the 3rd warn — send to mod channel for perm 2 approval
           const reqId = `muteReq-${Date.now()}`;
           pendingMuteRequests[reqId] = {
             targetId: targetUser.id,
@@ -694,7 +828,6 @@ client.on('interactionCreate', async interaction => {
             await modChannel.send({ content: `<@&${PERM_ROLES[2][0]}>`, embeds: [requestEmbed], components: [row] });
           }
 
-          // Inform the perm-1 mod it's being processed
           try {
             const processingEmbed = new EmbedBuilder()
               .setTitle('⏳ Mute Request Submitted')
@@ -765,7 +898,6 @@ client.on('interactionCreate', async interaction => {
 
       const unbanTime = new Date(Date.now() + durationMs);
 
-      // DM the user BEFORE banning
       try {
         const banDmEmbed = new EmbedBuilder()
           .setTitle('🔨 You Have Been Banned')
@@ -781,14 +913,12 @@ client.on('interactionCreate', async interaction => {
         await targetUser.send({ embeds: [banDmEmbed] });
       } catch {}
 
-      // Ban the user
       try {
         await targetMember.ban({ reason: `${reason} | Duration: ${humanDuration(durationMs)} | By: ${interaction.user.tag}` });
       } catch (err) {
         return interaction.editReply(`❌ Failed to ban: ${err.message}`);
       }
 
-      // Save ban to disk so it survives restarts
       savedBans[targetUser.id] = {
         expiresAt: Date.now() + durationMs,
         tag: targetUser.tag,
@@ -797,11 +927,7 @@ client.on('interactionCreate', async interaction => {
         duration: humanDuration(durationMs)
       };
       saveJSON(FILES.activeBans, savedBans);
-
-      // Schedule unban
       scheduleBanExpiry(targetUser.id, targetUser.tag, interaction.guild.id, durationMs);
-
-      // Log it
       await sendModLog(modLogEmbed('Member Banned', interaction.user, targetUser, { reason, duration: humanDuration(durationMs), color: 0xFF0000 }));
 
       return interaction.editReply(`✅ **${targetUser.tag}** has been banned for **${humanDuration(durationMs)}**.\nThey were DM'd before the ban.`);
@@ -827,11 +953,10 @@ client.on('interactionCreate', async interaction => {
 
     // ===== UNWARN =====
     if (interaction.commandName === 'unwarn') {
-      // To undo a Perm 1 warn you need Perm 2. To undo a Perm 2 warn you need Perm 3.
       if (permLevel < 2) return interaction.editReply('❌ You need at least Permission Level 2 to remove warnings.');
 
       const targetUser = interaction.options.getUser('user');
-      const warnIndex = interaction.options.getInteger('index') - 1; // convert to 0-based
+      const warnIndex = interaction.options.getInteger('index') - 1;
       const userWarns = warnings[targetUser.id] || [];
 
       if (userWarns.length === 0) return interaction.editReply(`✅ **${targetUser.tag}** has no warnings to remove.`);
@@ -839,26 +964,19 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply(`❌ Invalid warning number. **${targetUser.tag}** has ${userWarns.length} warning(s).`);
 
       const warn = userWarns[warnIndex];
-
-      // Check if the mod who issued the warn was perm 2 — if so need perm 3 to undo
-      // We stored moderatorId, fetch their current perm level
-      let warnIssuerPerm = 1; // default assume perm 1 if we can't find them
+      let warnIssuerPerm = 1;
       try {
         const warnIssuerMember = await interaction.guild.members.fetch(warn.moderatorId);
         warnIssuerPerm = getPermLevel(warnIssuerMember);
       } catch {}
 
-      // Perm 3 can remove any warning (including ones issued by other Perm 3s)
-      // Lower perms still need to outrank the issuer
       if (permLevel < 3 && warnIssuerPerm >= permLevel)
         return interaction.editReply(`❌ You need a higher permission level than the moderator who issued this warning (Perm ${warnIssuerPerm}) to remove it.`);
 
-      // Remove the warning
       warnings[targetUser.id].splice(warnIndex, 1);
       saveJSON(FILES.warnings, warnings);
       const remaining = warnings[targetUser.id].length;
 
-      // DM the user
       try {
         const dmEmbed = new EmbedBuilder()
           .setTitle('✅ Warning Removed')
@@ -873,7 +991,6 @@ client.on('interactionCreate', async interaction => {
         await targetUser.send({ embeds: [dmEmbed] });
       } catch {}
 
-      // Log it
       const logEmbed = new EmbedBuilder()
         .setTitle('🗑️ Warning Removed')
         .setColor(0x00FF00)
@@ -899,12 +1016,9 @@ client.on('interactionCreate', async interaction => {
       const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
 
       if (!targetMember) return interaction.editReply('❌ User not found in this server.');
-
-      // Check they are actually muted
       if (!targetMember.communicationDisabledUntil || targetMember.communicationDisabledUntil < new Date())
         return interaction.editReply('⚠️ That user is not currently muted.');
 
-      // Perm level check — perm 2 can unmute perm 1 mutes, perm 3 can unmute anyone
       const targetPerm = getPermLevel(targetMember);
       if (targetPerm >= permLevel)
         return interaction.editReply('❌ You cannot unmute someone with an equal or higher permission level than you.');
@@ -915,7 +1029,6 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply(`❌ Failed to unmute: ${err.message}`);
       }
 
-      // DM the user
       try {
         const dmEmbed = new EmbedBuilder()
           .setTitle('🔊 You Have Been Unmuted')
@@ -929,7 +1042,6 @@ client.on('interactionCreate', async interaction => {
         await targetUser.send({ embeds: [dmEmbed] });
       } catch {}
 
-      // Log it
       const logEmbed = new EmbedBuilder()
         .setTitle('🔊 Member Unmuted')
         .setColor(0x00FF00)
@@ -951,7 +1063,6 @@ client.on('interactionCreate', async interaction => {
       const userId = interaction.options.getString('userid');
       const reason = interaction.options.getString('reason') || 'No reason provided';
 
-      // Check they are actually banned
       let bannedUser;
       try {
         bannedUser = await interaction.guild.bans.fetch(userId);
@@ -961,13 +1072,11 @@ client.on('interactionCreate', async interaction => {
 
       try {
         await interaction.guild.members.unban(userId, `Unbanned by ${interaction.user.tag}: ${reason}`);
-      // Remove from persisted bans if present
-      if (savedBans[userId]) { delete savedBans[userId]; saveJSON(FILES.activeBans, savedBans); }
+        if (savedBans[userId]) { delete savedBans[userId]; saveJSON(FILES.activeBans, savedBans); }
       } catch (err) {
         return interaction.editReply(`❌ Failed to unban: ${err.message}`);
       }
 
-      // DM the user if possible
       try {
         const unbannedUser = await client.users.fetch(userId);
         const dmEmbed = new EmbedBuilder()
@@ -982,7 +1091,6 @@ client.on('interactionCreate', async interaction => {
         await unbannedUser.send({ embeds: [dmEmbed] });
       } catch {}
 
-      // Log it
       const logEmbed = new EmbedBuilder()
         .setTitle('🔓 Member Unbanned Early')
         .setColor(0x00FF00)
@@ -1011,26 +1119,120 @@ client.on('interactionCreate', async interaction => {
     const guild = interaction.guild;
     const member = guild ? await guild.members.fetch(interaction.user.id).catch(() => null) : null;
 
+    // ===== SSU APPROVE =====
+    if (interaction.customId.startsWith('ssuApprove-')) {
+      const reqId = interaction.customId.replace('ssuApprove-', '');
+      const req = pendingSSURequests[reqId];
+      if (!req) return interaction.reply({ content: '❌ Request not found or already handled.', ephemeral: true });
+      if (!WHITELIST_USERS.includes(interaction.user.id))
+        return interaction.reply({ content: '❌ Only whitelisted users can approve SSU requests.', ephemeral: true });
+      if (req.approvals.has(interaction.user.id))
+        return interaction.reply({ content: '⚠️ You have already approved this request.', ephemeral: true });
+
+      req.approvals.add(interaction.user.id);
+
+      if (req.approvals.size >= WHITELIST_USERS.length) {
+        // All WL users approved — launch the session
+        await interaction.reply({ content: '✅ You approved the SSU. All approvals received — session is now starting!', ephemeral: true });
+
+        // Clean up DM buttons for all WL users
+        for (const [wlId, msgId] of Object.entries(req.dmMessageIds)) {
+          try {
+            const wlUser = await client.users.fetch(wlId);
+            const dmChannel = await wlUser.createDM();
+            const dmMsg = await dmChannel.messages.fetch(msgId);
+            await dmMsg.edit({ components: [] });
+          } catch {}
+        }
+
+        // Notify the requester
+        try {
+          const approvedEmbed = new EmbedBuilder()
+            .setTitle('✅ SSU Request Approved')
+            .setColor(0x00FF00)
+            .setDescription('Your session start request has been approved by all whitelisted users! The session is now live.')
+            .setTimestamp();
+          const requester = await client.users.fetch(req.userId);
+          await requester.send({ embeds: [approvedEmbed] });
+        } catch {}
+
+        await executeSSU(req.userId, req.userTag, req.gameLink, req.schedId);
+        delete pendingSSURequests[reqId];
+
+      } else {
+        // Still waiting on more approvals
+        const remaining = WHITELIST_USERS.length - req.approvals.size;
+        await interaction.reply({ content: `✅ You approved the SSU request. Waiting for **${remaining}** more approval(s).`, ephemeral: true });
+
+        try {
+          const partialEmbed = new EmbedBuilder()
+            .setTitle('⏳ SSU Partially Approved')
+            .setColor(0xFFAA00)
+            .setDescription(`**${interaction.user.tag}** has approved your session request.\nWaiting for **${remaining}** more approval(s) before the session starts.`)
+            .setTimestamp();
+          const requester = await client.users.fetch(req.userId);
+          await requester.send({ embeds: [partialEmbed] });
+        } catch {}
+      }
+    }
+
+    // ===== SSU DENY =====
+    if (interaction.customId.startsWith('ssuDeny-')) {
+      const reqId = interaction.customId.replace('ssuDeny-', '');
+      const req = pendingSSURequests[reqId];
+      if (!req) return interaction.reply({ content: '❌ Request not found or already handled.', ephemeral: true });
+      if (!WHITELIST_USERS.includes(interaction.user.id))
+        return interaction.reply({ content: '❌ Only whitelisted users can deny SSU requests.', ephemeral: true });
+
+      await interaction.reply({ content: '✅ SSU request denied.', ephemeral: true });
+
+      // Clean up DM buttons for all WL users
+      for (const [wlId, msgId] of Object.entries(req.dmMessageIds)) {
+        try {
+          const wlUser = await client.users.fetch(wlId);
+          const dmChannel = await wlUser.createDM();
+          const dmMsg = await dmChannel.messages.fetch(msgId);
+          await dmMsg.edit({ components: [] });
+        } catch {}
+      }
+
+      // Notify the requester
+      try {
+        const deniedEmbed = new EmbedBuilder()
+          .setTitle('❌ SSU Request Denied')
+          .setColor(0xFF0000)
+          .setDescription(`Your session start request was denied by **${interaction.user.tag}**.`)
+          .setTimestamp();
+        const requester = await client.users.fetch(req.userId);
+        await requester.send({ embeds: [deniedEmbed] });
+      } catch {}
+
+      // Notify the other WL user so they know not to act on it
+      for (const wlId of WHITELIST_USERS) {
+        if (wlId === interaction.user.id) continue;
+        try {
+          const otherWl = await client.users.fetch(wlId);
+          await otherWl.send({ content: `ℹ️ The SSU request from **${req.userTag}** was denied by **${interaction.user.tag}**.` });
+        } catch {}
+      }
+
+      delete pendingSSURequests[reqId];
+    }
+
     // ===== MUTE APPROVE =====
     if (interaction.customId.startsWith('muteApprove-')) {
       const reqId = interaction.customId.replace('muteApprove-', '');
       const req = pendingMuteRequests[reqId];
       if (!req) return interaction.reply({ content: '❌ Request not found or already handled.', ephemeral: true });
 
-      // Ask how long to mute
-      await interaction.reply({
-        content: '⏱️ How long should the extended mute be? Reply in DMs or use the format `10m`, `2h`, `3d` — **Note: Use `/bloxy-mute` if available, or reply here with the time.**\n\nFor now, type the duration in this message and I will apply it. *(Feature: you can modify the bot to add a modal here)*\n\n**Applying 1 hour extended mute as default.** To customize, edit the bot to add a duration modal.',
-        ephemeral: true
-      });
+      await interaction.reply({ content: '✅ Applying 1 hour extended mute.', ephemeral: true });
 
-      // Default extended mute: 1 hour
       const extendedMs = 60 * 60 * 1000;
       try {
         const targetMember = await guild.members.fetch(req.targetId);
         await targetMember.timeout(extendedMs, `Extended mute approved by ${interaction.user.tag}`);
       } catch (err) { console.error('Extended mute failed:', err.message); }
 
-      // Notify the original mod
       try {
         const origMod = await client.users.fetch(req.moderatorId);
         const updateEmbed = new EmbedBuilder()
@@ -1040,7 +1242,6 @@ client.on('interactionCreate', async interaction => {
         await origMod.send({ embeds: [updateEmbed] });
       } catch {}
 
-      // Log
       const logEmbed = new EmbedBuilder().setTitle('🔇 Extended Mute Applied').setColor(0xFF6600)
         .setDescription(`Extended mute of 1 hour applied to <@${req.targetId}> (${req.targetTag}).`)
         .addFields(
@@ -1050,11 +1251,7 @@ client.on('interactionCreate', async interaction => {
       await sendModLog(logEmbed);
 
       delete pendingMuteRequests[reqId];
-
-      // Disable buttons on the message
-      try {
-        await interaction.message.edit({ components: [] });
-      } catch {}
+      try { await interaction.message.edit({ components: [] }); } catch {}
     }
 
     // ===== MUTE DENY =====
@@ -1063,7 +1260,6 @@ client.on('interactionCreate', async interaction => {
       const req = pendingMuteRequests[reqId];
       if (!req) return interaction.reply({ content: '❌ Request not found or already handled.', ephemeral: true });
 
-      // Notify the original mod
       try {
         const origMod = await client.users.fetch(req.moderatorId);
         const updateEmbed = new EmbedBuilder()
@@ -1080,7 +1276,6 @@ client.on('interactionCreate', async interaction => {
 
       delete pendingMuteRequests[reqId];
       try { await interaction.reply({ content: '✅ Extended mute denied. Original mod notified.', ephemeral: true }); } catch {}
-
       try { await interaction.message.edit({ components: [] }); } catch {}
     }
 
